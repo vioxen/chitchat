@@ -261,6 +261,9 @@ impl Chitchat {
                     self.scheduled_for_deletion_nodes().collect();
                 let self_digest = self.compute_digest(&scheduled_for_deletion);
                 let digest_len = self_digest.serialized_len(protocol_version);
+                // This is a corrupted local invariant, not a peer error. The
+                // caller deliberately terminates the supervised gossip task
+                // so the owner restarts it instead of staying half-alive.
                 anyhow::ensure!(
                     digest_len <= MAX_GOSSIP_DIGEST_SIZE,
                     "local gossip digest is too large for a safe response: {digest_len} bytes"
