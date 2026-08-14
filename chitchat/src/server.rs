@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, warn};
 
-use crate::message::ChitchatEnvelope;
+use crate::message::{ChitchatEnvelope, ChitchatMessage};
 use crate::transport::{RecvOutcome, Socket, Transport};
 use crate::{Chitchat, ChitchatConfig, ChitchatId};
 
@@ -175,7 +175,9 @@ impl ChitchatHandle {
 
     /// Calls a function with mutable access to the [`Chitchat`].
     pub async fn with_chitchat<F, T>(&self, mut fun: F) -> T
-    where F: FnMut(&mut Chitchat) -> T {
+    where
+        F: FnMut(&mut Chitchat) -> T,
+    {
         let mut chitchat = self.chitchat.lock().await;
         fun(&mut chitchat)
     }
@@ -244,7 +246,7 @@ impl Server {
             tokio::select! {
                 result = self.transport.recv() => match result {
                     Ok(RecvOutcome { from_addr, envelope, .. }) => {
-                        let _ = self.handle_envelope(from_addr, envelope).await;
+                        self.handle_envelope(from_addr, envelope).await?;
                     }
                     // Transient errors (e.g. ENOBUFS) are swallowed inside
                     // Socket::recv. An error here means the socket is broken.
@@ -254,7 +256,7 @@ impl Server {
                     }
                 },
                 _ = gossip_interval.tick() => {
-                    self.gossip_multiple().await
+                    self.gossip_multiple().await?
                 },
                 command = self.command_rx.recv() => match command {
                     Some(Command::Gossip(addr)) => {
@@ -275,20 +277,29 @@ impl Server {
     ) -> anyhow::Result<()> {
         let version = envelope.version;
         // Handle gossip message from other servers.
-        let response = self.chitchat.lock().await.process_message(envelope.message);
+        let response = self
+            .chitchat
+            .lock()
+            .await
+            .process_message(envelope.message, version)?;
         // Send the reply, if any, echoing the version the peer used: having
         // decoded its message we know it supports that format, so the reply is
         // guaranteed to be decodable on its end.
         if let Some(message) = response {
-            self.transport
-                .send(from_addr, ChitchatEnvelope { version, message })
-                .await?;
+            let response_envelope = ChitchatEnvelope { version, message };
+            anyhow::ensure!(
+                response_envelope.serialized_len() <= crate::MAX_UDP_DATAGRAM_PAYLOAD_SIZE,
+                "local gossip response exceeds the UDP payload limit"
+            );
+            if let Err(error) = self.transport.send(from_addr, response_envelope).await {
+                warn!(error=?error, peer_address=%from_addr, "Failed to send gossip response");
+            }
         }
         Ok(())
     }
 
     /// Gossip to multiple randomly chosen nodes.
-    async fn gossip_multiple(&mut self) {
+    async fn gossip_multiple(&mut self) -> anyhow::Result<()> {
         // Gossip with live nodes & probabilistically include a random dead node
         let mut chitchat_guard = self.chitchat.lock().await;
         let cluster_state = chitchat_guard.cluster_state();
@@ -322,6 +333,18 @@ impl Server {
 
         chitchat_guard.update_self_heartbeat();
         chitchat_guard.gc_keys_marked_for_deletion();
+        let protocol_version = chitchat_guard.config.protocol_version;
+        let local_digest_len = match chitchat_guard.create_syn_message() {
+            ChitchatMessage::Syn { digest, .. } => digest.serialized_len(protocol_version),
+            _ => unreachable!("create_syn_message must return a SYN"),
+        };
+        // An oversized local digest is a corrupted membership invariant. Stop
+        // the supervised runtime so its owner can restart with fresh state;
+        // continuing would look healthy while every gossip reply is unsafe.
+        anyhow::ensure!(
+            local_digest_len <= crate::MAX_GOSSIP_DIGEST_SIZE,
+            "local gossip digest is too large for safe publication: {local_digest_len} bytes"
+        );
 
         // Drop lock to prevent deadlock in [`UdpSocket::gossip`].
         drop(chitchat_guard);
@@ -344,6 +367,7 @@ impl Server {
         // Update nodes liveness.
         let mut chitchat_guard = self.chitchat.lock().await;
         chitchat_guard.update_nodes_liveness();
+        Ok(())
     }
 
     /// Gossips with another peer.
@@ -355,6 +379,10 @@ impl Server {
                 message: chitchat.create_syn_message(),
             }
         };
+        anyhow::ensure!(
+            syn.serialized_len() <= crate::MAX_UDP_DATAGRAM_PAYLOAD_SIZE,
+            "local gossip SYN exceeds the UDP payload limit"
+        );
         self.transport.send(addr, syn).await?;
         Ok(())
     }
@@ -459,6 +487,7 @@ mod tests {
     use tokio_stream::{Stream, StreamExt};
 
     use super::*;
+    use crate::digest::Digest;
     use crate::message::{ChitchatEnvelope, ChitchatMessage, ProtocolVersion};
     use crate::transport::{ChannelTransport, Transport};
     use crate::{Heartbeat, MAX_UDP_DATAGRAM_PAYLOAD_SIZE, NodeState};
@@ -692,8 +721,13 @@ mod tests {
             .with_chitchat(|server_chitchat| {
                 server_chitchat.update_self_heartbeat();
                 let syn = server_chitchat.create_syn_message();
-                let syn_ack = test_chitchat.process_message(syn).unwrap();
-                server_chitchat.process_message(syn_ack);
+                let syn_ack = test_chitchat
+                    .process_message(syn, ProtocolVersion::V0)
+                    .unwrap()
+                    .unwrap();
+                server_chitchat
+                    .process_message(syn_ack, ProtocolVersion::V0)
+                    .unwrap();
             })
             .await;
 
@@ -709,7 +743,10 @@ mod tests {
         let syn_envelope = timeout(test_transport.recv()).await.unwrap().envelope;
 
         // Reply.
-        let syn_ack = test_chitchat.process_message(syn_envelope.message).unwrap();
+        let syn_ack = test_chitchat
+            .process_message(syn_envelope.message, syn_envelope.version)
+            .unwrap()
+            .unwrap();
         test_transport
             .send(
                 server_addr,
@@ -885,6 +922,78 @@ mod tests {
             .unwrap();
         let err = server_handle.termination_watcher().await.unwrap_err();
         assert_eq!(err.to_string(), "Chitchat server panicked");
+        server_handle.shutdown().await.unwrap_err();
+    }
+
+    async fn inject_oversized_membership(server_handle: &ChitchatHandle) {
+        server_handle
+            .with_chitchat(|chitchat| {
+                for i in 0..70 {
+                    let chitchat_id = ChitchatId {
+                        node_id: Arc::from(format!("poison-{i}-{}", "x".repeat(1000))),
+                        generation_id: i as u64,
+                        gossip_advertise_addr: SocketAddr::from((
+                            [127, 0, 0, 1],
+                            20_000 + i as u16,
+                        )),
+                    };
+                    chitchat.report_heartbeat(&chitchat_id, Heartbeat(1));
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_unsafe_response_size_stops_the_supervised_server() {
+        let client_config = ChitchatConfig::for_test(1);
+        let client_addr = client_config.chitchat_id.gossip_advertise_addr;
+        let transport = ChannelTransport::with_mtu(MAX_UDP_DATAGRAM_PAYLOAD_SIZE);
+        let mut client_transport = transport.open(client_addr).await.unwrap();
+
+        let server_config = ChitchatConfig::for_test(2);
+        let server_addr = server_config.chitchat_id.gossip_advertise_addr;
+        let cluster_id = server_config.cluster_id.clone();
+        let server_handle = spawn_chitchat(server_config, Vec::new(), &transport)
+            .await
+            .unwrap();
+        inject_oversized_membership(&server_handle).await;
+
+        client_transport
+            .send(
+                server_addr,
+                ChitchatEnvelope::new_syn_v0(cluster_id, Digest::default()),
+            )
+            .await
+            .unwrap();
+
+        let error = server_handle.termination_watcher().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("local gossip digest is too large")
+        );
+        server_handle.shutdown().await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_unsafe_outbound_digest_stops_the_supervised_server() {
+        let transport = ChannelTransport::with_mtu(MAX_UDP_DATAGRAM_PAYLOAD_SIZE);
+        let server_config = ChitchatConfig::for_test(2);
+        let server_handle = spawn_chitchat(server_config, Vec::new(), &transport)
+            .await
+            .unwrap();
+        inject_oversized_membership(&server_handle).await;
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), server_handle.termination_watcher())
+                .await
+                .expect("periodic gossip should detect the invalid local digest")
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("local gossip digest is too large")
+        );
         server_handle.shutdown().await.unwrap_err();
     }
 }
