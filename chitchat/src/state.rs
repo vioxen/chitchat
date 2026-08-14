@@ -636,6 +636,14 @@ impl ClusterState {
         mtu: usize,
         scheduled_for_deletion: &HashSet<&ChitchatId>,
     ) -> Delta {
+        if mtu < 100 {
+            warn!(
+                mtu,
+                "delta budget is too small; returning an empty delta instead of panicking"
+            );
+            return Delta::default();
+        }
+
         let mut stale_nodes = SortedStaleNodes::default();
 
         for (chitchat_id, node_state) in &self.node_states {

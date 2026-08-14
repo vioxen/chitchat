@@ -1,7 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use async_trait::async_trait;
 use tracing::warn;
 
@@ -64,6 +64,10 @@ impl Socket for UdpSocket {
     ) -> anyhow::Result<SendOutcome> {
         self.buf_send.clear();
         envelope.serialize(&mut self.buf_send);
+        ensure!(
+            self.buf_send.len() <= MAX_UDP_DATAGRAM_PAYLOAD_SIZE,
+            "serialized chitchat envelope exceeds the UDP payload limit"
+        );
         let num_bytes_sent = self.send_bytes(to_addr, &self.buf_send).await?;
         Ok(SendOutcome { num_bytes_sent })
     }

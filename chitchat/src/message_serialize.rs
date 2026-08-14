@@ -91,7 +91,6 @@ impl ChitchatEnvelope {
         buf
     }
 
-    #[cfg(test)]
     pub(crate) fn serialized_len(&self) -> usize {
         Self::HEADER_LEN
             + match &self.message {

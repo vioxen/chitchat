@@ -14,6 +14,7 @@ mod state;
 pub mod transport;
 mod types;
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::iter::once;
 use std::net::SocketAddr;
@@ -63,6 +64,14 @@ pub fn setup_tracing_for_tests() {
 /// An Ethernet frame size of 1400B would limit us to 20 nodes
 /// or so.
 pub(crate) const MAX_UDP_DATAGRAM_PAYLOAD_SIZE: usize = 65_507;
+
+/// Maximum serialized size of the membership digest in either wire format.
+///
+/// The remaining bytes are reserved for the envelope, a useful delta, and
+/// small version-width growth as heartbeats and state versions advance. This
+/// also bounds membership learned from a peer, preventing stale incarnations
+/// from poisoning every later gossip exchange.
+pub(crate) const MAX_GOSSIP_DIGEST_SIZE: usize = 60_000;
 
 /// Number of bytes left for a delta payload in a single reply datagram, once
 /// the message header and `reserved_len` bytes (e.g. a digest carried in the
@@ -131,7 +140,46 @@ impl Chitchat {
     /// the cluster.
     fn report_heartbeats_in_digest(&mut self, digest: &Digest) {
         for (chitchat_id, node_digest) in &digest.node_digests {
+            if self.cluster_state.node_state(chitchat_id).is_some() {
+                self.report_heartbeat(chitchat_id, node_digest.heartbeat);
+            }
+        }
+
+        let scheduled_for_deletion: HashSet<_> = self.scheduled_for_deletion_nodes().collect();
+        let mut projected_digest = self.compute_digest(&scheduled_for_deletion);
+        let mut unknown_nodes: Vec<_> = digest
+            .node_digests
+            .iter()
+            .filter(|(chitchat_id, _)| self.cluster_state.node_state(chitchat_id).is_none())
+            .collect();
+        unknown_nodes.sort_by_key(|(chitchat_id, _)| Reverse(chitchat_id.generation_id));
+        let unknown_node_count = unknown_nodes.len();
+
+        let mut rejected_nodes = 0usize;
+        for (index, (chitchat_id, node_digest)) in unknown_nodes.into_iter().enumerate() {
+            projected_digest
+                .node_digests
+                .insert(chitchat_id.clone(), *node_digest);
+            let fits = [ProtocolVersion::V0, ProtocolVersion::V1]
+                .into_iter()
+                .all(|version| projected_digest.serialized_len(version) <= MAX_GOSSIP_DIGEST_SIZE);
+            if !fits {
+                projected_digest.node_digests.remove(chitchat_id);
+                // Entries are ordered newest-first. Once the budget is full,
+                // stop importing older incarnations instead of repeatedly
+                // recompressing the same near-limit digest.
+                rejected_nodes = unknown_node_count - index;
+                break;
+            }
             self.report_heartbeat(chitchat_id, node_digest.heartbeat);
+        }
+
+        if rejected_nodes > 0 {
+            warn!(
+                rejected_nodes,
+                max_digest_size = MAX_GOSSIP_DIGEST_SIZE,
+                "ignored gossip members that would exceed the safe digest budget"
+            );
         }
     }
 
@@ -145,7 +193,11 @@ impl Chitchat {
         }
     }
 
-    pub(crate) fn process_message(&mut self, msg: ChitchatMessage) -> Option<ChitchatMessage> {
+    pub(crate) fn process_message(
+        &mut self,
+        msg: ChitchatMessage,
+        protocol_version: ProtocolVersion,
+    ) -> anyhow::Result<Option<ChitchatMessage>> {
         self.update_self_heartbeat();
 
         match msg {
@@ -156,22 +208,26 @@ impl Chitchat {
                         their_cluster_id=%cluster_id,
                         "received SYN message addressed to a different cluster"
                     );
-                    return Some(ChitchatMessage::BadCluster);
+                    return Ok(Some(ChitchatMessage::BadCluster));
                 }
                 self.report_heartbeats_in_digest(&digest);
                 let scheduled_for_deletion: HashSet<_> =
                     self.scheduled_for_deletion_nodes().collect();
                 let self_digest = self.compute_digest(&scheduled_for_deletion);
-                let protocol_version = self.config.protocol_version;
+                let digest_len = self_digest.serialized_len(protocol_version);
+                anyhow::ensure!(
+                    digest_len <= MAX_GOSSIP_DIGEST_SIZE,
+                    "local gossip digest is too large for a safe response: {digest_len} bytes"
+                );
                 let delta = self.cluster_state.compute_partial_delta_respecting_mtu(
                     &digest,
-                    delta_mtu(self_digest.serialized_len(protocol_version)),
+                    delta_mtu(digest_len),
                     &scheduled_for_deletion,
                 );
-                Some(ChitchatMessage::SynAck {
+                Ok(Some(ChitchatMessage::SynAck {
                     digest: self_digest,
                     delta,
-                })
+                }))
             }
             ChitchatMessage::SynAck { digest, delta } => {
                 self.report_heartbeats_in_digest(&digest);
@@ -183,15 +239,15 @@ impl Chitchat {
                     delta_mtu(0),
                     &scheduled_for_deletion,
                 );
-                Some(ChitchatMessage::Ack { delta })
+                Ok(Some(ChitchatMessage::Ack { delta }))
             }
             ChitchatMessage::Ack { delta } => {
                 self.process_delta(delta);
-                None
+                Ok(None)
             }
             ChitchatMessage::BadCluster => {
                 warn!("message rejected by peer: wrong cluster");
-                None
+                Ok(None)
             }
             #[cfg(test)]
             ChitchatMessage::PanicForTest => {
@@ -566,10 +622,22 @@ mod tests {
     }
 
     fn run_chitchat_handshake(initiating_node: &mut Chitchat, peer_node: &mut Chitchat) {
+        let protocol_version = initiating_node.config.protocol_version;
         let syn_message = initiating_node.create_syn_message();
-        let syn_ack_message = peer_node.process_message(syn_message).unwrap();
-        let ack_message = initiating_node.process_message(syn_ack_message).unwrap();
-        assert!(peer_node.process_message(ack_message).is_none());
+        let syn_ack_message = peer_node
+            .process_message(syn_message, protocol_version)
+            .unwrap()
+            .unwrap();
+        let ack_message = initiating_node
+            .process_message(syn_ack_message, protocol_version)
+            .unwrap()
+            .unwrap();
+        assert!(
+            peer_node
+                .process_message(ack_message, protocol_version)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Checks that all of the non-deleted key-values pairs are the same in
@@ -1298,7 +1366,10 @@ mod tests {
         let mut digest = Digest::default();
         let peer_id = ChitchatId::for_local_test(10_002);
         digest.add_node(peer_id, Heartbeat::default(), 10, 30);
-        let _ = node.process_message(ChitchatMessage::Syn { cluster_id, digest });
+        let _ = node.process_message(
+            ChitchatMessage::Syn { cluster_id, digest },
+            ProtocolVersion::V0,
+        );
 
         let delta = Delta::default();
         node.process_delta(delta);
@@ -1538,7 +1609,10 @@ mod tests {
     #[tokio::test]
     async fn test_process_syn() {
         // Prepare node
-        let config = ChitchatConfig::for_test(10_006);
+        let mut config = ChitchatConfig::for_test(10_006);
+        // A V1-capable responder must budget a reply using the V0 format of
+        // the initiating peer during a rolling upgrade.
+        config.protocol_version = ProtocolVersion::V1;
 
         fn id(i: usize) -> ChitchatId {
             ChitchatId {
@@ -1575,10 +1649,14 @@ mod tests {
         // Process a SYN message with an empty foreign digest
 
         let ack = node
-            .process_message(ChitchatMessage::Syn {
-                cluster_id: node.config.cluster_id.clone(),
-                digest: Digest::default(),
-            })
+            .process_message(
+                ChitchatMessage::Syn {
+                    cluster_id: node.config.cluster_id.clone(),
+                    digest: Digest::default(),
+                },
+                ProtocolVersion::V0,
+            )
+            .unwrap()
             .unwrap();
 
         // Verify that the serialized reply fits within the max MTU.
@@ -1594,5 +1672,74 @@ mod tests {
             panic!("Expected SynAck, got {:?}", ack_envelope.message);
         };
         assert_eq!(delta.node_deltas.len(), 4);
+    }
+
+    #[test]
+    fn test_membership_import_is_bounded_and_prefers_newer_incarnations() {
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+
+        let id = |i: usize| ChitchatId {
+            node_id: Arc::from(format!("node-{i}-{}", "x".repeat(1000))),
+            generation_id: i as u64,
+            gossip_advertise_addr: SocketAddr::from(([127, 0, 0, 1], 10_000 + i as u16)),
+        };
+        let mut oversized_digest = Digest::default();
+        for i in 0..100 {
+            oversized_digest.add_node(id(i), Heartbeat(1), 0, 0);
+        }
+
+        node.report_heartbeats_in_digest(&oversized_digest);
+        let digest = node.compute_digest(&HashSet::new());
+        assert!(digest.serialized_len(ProtocolVersion::V0) <= MAX_GOSSIP_DIGEST_SIZE);
+        assert!(digest.serialized_len(ProtocolVersion::V1) <= MAX_GOSSIP_DIGEST_SIZE);
+        assert!(node.cluster_state.node_state(&id(99)).is_some());
+        assert!(node.cluster_state.node_state(&id(0)).is_none());
+    }
+
+    #[test]
+    fn test_unsafe_local_digest_fails_closed_without_panicking() {
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+
+        for i in 0..70 {
+            let chitchat_id = ChitchatId {
+                node_id: Arc::from(format!("poison-{i}-{}", "x".repeat(1000))),
+                generation_id: i as u64,
+                gossip_advertise_addr: SocketAddr::from(([127, 0, 0, 1], 20_000 + i as u16)),
+            };
+            node.report_heartbeat(&chitchat_id, Heartbeat(1));
+        }
+
+        let error = node
+            .process_message(
+                ChitchatMessage::Syn {
+                    cluster_id: node.config.cluster_id.clone(),
+                    digest: Digest::default(),
+                },
+                ProtocolVersion::V0,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("local gossip digest is too large")
+        );
+    }
+
+    #[test]
+    fn test_tiny_delta_budget_returns_empty_delta() {
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+
+        let delta = node.cluster_state.compute_partial_delta_respecting_mtu(
+            &Digest::default(),
+            0,
+            &HashSet::new(),
+        );
+        assert!(delta.node_deltas.is_empty());
     }
 }
