@@ -14,8 +14,9 @@ mod state;
 pub mod transport;
 mod types;
 
-use std::cmp::Reverse;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::iter::once;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
@@ -72,6 +73,13 @@ pub(crate) const MAX_UDP_DATAGRAM_PAYLOAD_SIZE: usize = 65_507;
 /// also bounds membership learned from a peer, preventing stale incarnations
 /// from poisoning every later gossip exchange.
 pub(crate) const MAX_GOSSIP_DIGEST_SIZE: usize = 60_000;
+
+fn membership_admission_score(receiver: &ChitchatId, candidate: &ChitchatId) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    receiver.hash(&mut hasher);
+    candidate.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Number of bytes left for a delta payload in a single reply datagram, once
 /// the message header and `reserved_len` bytes (e.g. a digest carried in the
@@ -146,38 +154,69 @@ impl Chitchat {
         }
 
         let scheduled_for_deletion: HashSet<_> = self.scheduled_for_deletion_nodes().collect();
-        let mut projected_digest = self.compute_digest(&scheduled_for_deletion);
-        let mut unknown_nodes: Vec<_> = digest
-            .node_digests
-            .iter()
-            .filter(|(chitchat_id, node_digest)| {
-                self.cluster_state.node_state(chitchat_id).is_none()
-                    && self
-                        .cluster_state
-                        .last_heartbeat_if_deleted(chitchat_id)
-                        .map(|last_heartbeat| last_heartbeat < node_digest.heartbeat)
-                        .unwrap_or(true)
+        let projected_digest = self.compute_digest(&scheduled_for_deletion);
+        let mut projected_entries_len = projected_digest.uncompressed_entries_len();
+        let mut newest_unknown_by_node_id = BTreeMap::new();
+        for (chitchat_id, node_digest) in
+            digest
+                .node_digests
+                .iter()
+                .filter(|(chitchat_id, node_digest)| {
+                    self.cluster_state.node_state(chitchat_id).is_none()
+                        && self
+                            .cluster_state
+                            .last_heartbeat_if_deleted(chitchat_id)
+                            .map(|last_heartbeat| last_heartbeat < node_digest.heartbeat)
+                            .unwrap_or(true)
+                })
+        {
+            let candidate = (chitchat_id, node_digest);
+            newest_unknown_by_node_id
+                .entry(chitchat_id.node_id.as_ref())
+                .and_modify(|current: &mut (&ChitchatId, &crate::digest::NodeDigest)| {
+                    let current_rank = (current.0.generation_id, current.1.heartbeat, current.0);
+                    let candidate_rank = (
+                        candidate.0.generation_id,
+                        candidate.1.heartbeat,
+                        candidate.0,
+                    );
+                    if candidate_rank > current_rank {
+                        *current = candidate;
+                    }
+                })
+                .or_insert(candidate);
+        }
+
+        let receiver = &self.config.chitchat_id;
+        let mut unknown_nodes: Vec<_> = newest_unknown_by_node_id
+            .into_values()
+            .map(|(chitchat_id, node_digest)| {
+                (
+                    membership_admission_score(receiver, chitchat_id),
+                    chitchat_id,
+                    node_digest,
+                )
             })
             .collect();
-        unknown_nodes.sort_by_key(|(chitchat_id, _)| Reverse(chitchat_id.generation_id));
-        let unknown_node_count = unknown_nodes.len();
+        // Receiver-specific rendezvous ordering spreads a bounded membership
+        // subset across peers without globally penalizing older processes.
+        unknown_nodes.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
 
         let mut rejected_nodes = 0usize;
-        for (index, (chitchat_id, node_digest)) in unknown_nodes.into_iter().enumerate() {
-            projected_digest
-                .node_digests
-                .insert(chitchat_id.clone(), *node_digest);
+        for (_, chitchat_id, node_digest) in unknown_nodes {
+            let candidate_entries_len = projected_entries_len
+                .saturating_add(Digest::entry_serialized_len(chitchat_id, node_digest));
             let fits = [ProtocolVersion::V0, ProtocolVersion::V1]
                 .into_iter()
-                .all(|version| projected_digest.serialized_len(version) <= MAX_GOSSIP_DIGEST_SIZE);
+                .all(|version| {
+                    Digest::serialized_len_upper_bound_for_entries(candidate_entries_len, version)
+                        <= MAX_GOSSIP_DIGEST_SIZE
+                });
             if !fits {
-                projected_digest.node_digests.remove(chitchat_id);
-                // Entries are ordered newest-first. Once the budget is full,
-                // stop importing older incarnations instead of repeatedly
-                // recompressing the same near-limit digest.
-                rejected_nodes = unknown_node_count - index;
-                break;
+                rejected_nodes += 1;
+                continue;
             }
+            projected_entries_len = candidate_entries_len;
             self.report_heartbeat(chitchat_id, node_digest.heartbeat);
         }
 
@@ -1623,7 +1662,7 @@ mod tests {
 
         fn id(i: usize) -> ChitchatId {
             ChitchatId {
-                node_id: Arc::from("a".repeat(1000).as_str()),
+                node_id: Arc::from(format!("{i:04}-{}", "a".repeat(995))),
                 generation_id: i as u64,
                 gossip_advertise_addr: SocketAddr::from(([127, 0, 0, 1], 10000u16 + i as u16)),
             }
@@ -1682,7 +1721,7 @@ mod tests {
     }
 
     #[test]
-    fn test_membership_import_is_bounded_and_prefers_newer_incarnations() {
+    fn test_membership_import_is_bounded_and_uses_receiver_specific_order() {
         let config = ChitchatConfig::for_test(10_006);
         let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
         let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
@@ -1697,12 +1736,47 @@ mod tests {
             oversized_digest.add_node(id(i), Heartbeat(1), 0, 0);
         }
 
+        let receiver = node.config.chitchat_id.clone();
+        let highest_score_id = (0..100)
+            .map(id)
+            .max_by_key(|candidate| membership_admission_score(&receiver, candidate))
+            .unwrap();
+        let lowest_score_id = (0..100)
+            .map(id)
+            .min_by_key(|candidate| membership_admission_score(&receiver, candidate))
+            .unwrap();
+
         node.report_heartbeats_in_digest(&oversized_digest);
         let digest = node.compute_digest(&HashSet::new());
         assert!(digest.serialized_len(ProtocolVersion::V0) <= MAX_GOSSIP_DIGEST_SIZE);
         assert!(digest.serialized_len(ProtocolVersion::V1) <= MAX_GOSSIP_DIGEST_SIZE);
-        assert!(node.cluster_state.node_state(&id(99)).is_some());
-        assert!(node.cluster_state.node_state(&id(0)).is_none());
+        assert!(node.cluster_state.node_state(&highest_score_id).is_some());
+        assert!(node.cluster_state.node_state(&lowest_score_id).is_none());
+    }
+
+    #[test]
+    fn test_membership_import_keeps_only_newest_unknown_incarnation_per_node() {
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let old_id = ChitchatId {
+            node_id: Arc::from("restarted-node"),
+            generation_id: 1,
+            gossip_advertise_addr: SocketAddr::from(([127, 0, 0, 1], 20_001)),
+        };
+        let new_id = ChitchatId {
+            node_id: old_id.node_id.clone(),
+            generation_id: 2,
+            gossip_advertise_addr: SocketAddr::from(([127, 0, 0, 1], 20_002)),
+        };
+        let mut digest = Digest::default();
+        digest.add_node(old_id.clone(), Heartbeat(100), 0, 0);
+        digest.add_node(new_id.clone(), Heartbeat(1), 0, 0);
+
+        node.report_heartbeats_in_digest(&digest);
+
+        assert!(node.cluster_state.node_state(&old_id).is_none());
+        assert!(node.cluster_state.node_state(&new_id).is_some());
     }
 
     #[test]

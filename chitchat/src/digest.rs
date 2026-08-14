@@ -5,7 +5,7 @@ use crate::serialize::*;
 use crate::{ChitchatId, Heartbeat, Version};
 
 /// Block size used by the compressed digest stream.
-const DIGEST_BLOCK_THRESHOLD: u16 = 16_384u16;
+const DIGEST_BLOCK_THRESHOLD: usize = 16_384;
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub(crate) struct NodeDigest {
@@ -93,6 +93,37 @@ impl Digest {
 }
 
 impl Digest {
+    pub(crate) fn uncompressed_entries_len(&self) -> usize {
+        self.node_digests
+            .iter()
+            .map(|(chitchat_id, node_digest)| {
+                chitchat_id.serialized_len() + node_digest.serialized_len()
+            })
+            .sum()
+    }
+
+    pub(crate) fn entry_serialized_len(
+        chitchat_id: &ChitchatId,
+        node_digest: &NodeDigest,
+    ) -> usize {
+        chitchat_id.serialized_len() + node_digest.serialized_len()
+    }
+
+    pub(crate) fn serialized_len_upper_bound_for_entries(
+        entries_len: usize,
+        protocol_version: ProtocolVersion,
+    ) -> usize {
+        match protocol_version {
+            ProtocolVersion::V0 => u16::default().serialized_len() + entries_len,
+            ProtocolVersion::V1 => {
+                let block_count = entries_len.div_ceil(DIGEST_BLOCK_THRESHOLD);
+                // Each uncompressed block has a one-byte tag and a u16 length;
+                // the stream ends with a one-byte NoMoreBlocks tag.
+                entries_len + block_count * 3 + 1
+            }
+        }
+    }
+
     /// Serializes the digest using the wire format selected by `protocol_version`.
     pub(crate) fn serialize(&self, protocol_version: ProtocolVersion, buf: &mut Vec<u8>) {
         match protocol_version {
@@ -142,7 +173,7 @@ impl Digest {
     /// stream of `(ChitchatId, NodeDigest)` entries.
     fn serialize_v1(&self, buf: &mut Vec<u8>) {
         let mut stream_writer =
-            CompressedStreamWriter::with_block_threshold(DIGEST_BLOCK_THRESHOLD);
+            CompressedStreamWriter::with_block_threshold(DIGEST_BLOCK_THRESHOLD as u16);
         for (chitchat_id, node_digest) in &self.node_digests {
             stream_writer.append(chitchat_id);
             stream_writer.append(node_digest);
@@ -225,5 +256,22 @@ mod tests {
             digest_serdeser_aux(&digest, ProtocolVersion::V0),
             digest_serdeser_aux(&digest, ProtocolVersion::V1),
         );
+    }
+
+    #[test]
+    fn test_incremental_size_bounds_cover_both_wire_formats() {
+        for num_nodes in [0u16, 1, 100, 1_000] {
+            let digest = Digest::sample_for_test(num_nodes);
+            let entries_len = digest.uncompressed_entries_len();
+            for protocol_version in [ProtocolVersion::V0, ProtocolVersion::V1] {
+                assert!(
+                    digest.serialized_len(protocol_version)
+                        <= Digest::serialized_len_upper_bound_for_entries(
+                            entries_len,
+                            protocol_version,
+                        )
+                );
+            }
+        }
     }
 }
