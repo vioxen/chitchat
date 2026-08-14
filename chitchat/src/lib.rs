@@ -150,7 +150,14 @@ impl Chitchat {
         let mut unknown_nodes: Vec<_> = digest
             .node_digests
             .iter()
-            .filter(|(chitchat_id, _)| self.cluster_state.node_state(chitchat_id).is_none())
+            .filter(|(chitchat_id, node_digest)| {
+                self.cluster_state.node_state(chitchat_id).is_none()
+                    && self
+                        .cluster_state
+                        .last_heartbeat_if_deleted(chitchat_id)
+                        .map(|last_heartbeat| last_heartbeat < node_digest.heartbeat)
+                        .unwrap_or(true)
+            })
             .collect();
         unknown_nodes.sort_by_key(|(chitchat_id, _)| Reverse(chitchat_id.generation_id));
         let unknown_node_count = unknown_nodes.len();
@@ -1696,6 +1703,35 @@ mod tests {
         assert!(digest.serialized_len(ProtocolVersion::V1) <= MAX_GOSSIP_DIGEST_SIZE);
         assert!(node.cluster_state.node_state(&id(99)).is_some());
         assert!(node.cluster_state.node_state(&id(0)).is_none());
+    }
+
+    #[test]
+    fn test_garbage_collected_replays_do_not_consume_membership_budget() {
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let mut replay_digest = Digest::default();
+
+        for i in 0..100 {
+            let replayed_id = ChitchatId {
+                node_id: Arc::from(format!("deleted-{i}-{}", "x".repeat(1000))),
+                generation_id: 1_000 + i as u64,
+                gossip_advertise_addr: SocketAddr::from(([127, 0, 0, 1], 10_000 + i as u16)),
+            };
+            node.report_heartbeat(&replayed_id, Heartbeat(10));
+            node.cluster_state.remove_node(&replayed_id);
+            replay_digest.add_node(replayed_id, Heartbeat(10), 0, 0);
+        }
+
+        let fresh_id = ChitchatId {
+            node_id: Arc::from("fresh-node"),
+            generation_id: 1,
+            gossip_advertise_addr: SocketAddr::from(([127, 0, 0, 1], 20_000)),
+        };
+        replay_digest.add_node(fresh_id.clone(), Heartbeat(1), 0, 0);
+
+        node.report_heartbeats_in_digest(&replay_digest);
+        assert!(node.cluster_state.node_state(&fresh_id).is_some());
     }
 
     #[test]
