@@ -175,7 +175,9 @@ impl ChitchatHandle {
 
     /// Calls a function with mutable access to the [`Chitchat`].
     pub async fn with_chitchat<F, T>(&self, mut fun: F) -> T
-    where F: FnMut(&mut Chitchat) -> T {
+    where
+        F: FnMut(&mut Chitchat) -> T,
+    {
         let mut chitchat = self.chitchat.lock().await;
         fun(&mut chitchat)
     }

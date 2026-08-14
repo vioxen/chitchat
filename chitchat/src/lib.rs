@@ -29,7 +29,7 @@ pub use listener::ListenerHandle;
 pub use serialize::{Deserializable, Serializable};
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 pub use self::configuration::{CatchupCallback, ChitchatConfig};
 pub use self::state::{ClusterStateSnapshot, NodeState};
@@ -221,7 +221,7 @@ impl Chitchat {
         }
 
         if rejected_nodes > 0 {
-            warn!(
+            debug!(
                 rejected_nodes,
                 max_digest_size = MAX_GOSSIP_DIGEST_SIZE,
                 "ignored gossip members that would exceed the safe digest budget"
