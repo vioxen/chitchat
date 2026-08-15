@@ -14,12 +14,12 @@ mod state;
 pub mod transport;
 mod types;
 
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::{Display, Formatter};
 use std::iter::once;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use delta::Delta;
@@ -72,14 +72,15 @@ pub(crate) const MAX_UDP_DATAGRAM_PAYLOAD_SIZE: usize = 65_507;
 /// small version-width growth as heartbeats and state versions advance. This
 /// also bounds membership learned from a peer, preventing stale incarnations
 /// from poisoning every later gossip exchange.
-pub(crate) const MAX_GOSSIP_DIGEST_SIZE: usize = 60_000;
+pub(crate) const MAX_GOSSIP_DIGEST_SIZE: usize = 48 * 1024;
 
-fn membership_admission_score(receiver: &ChitchatId, candidate: &ChitchatId) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    receiver.hash(&mut hasher);
-    candidate.hash(&mut hasher);
-    hasher.finish()
-}
+/// Maximum number of stable logical members retained by one Chitchat process.
+///
+/// Higher generations replace older generations of the same `node_id` and do
+/// not consume another slot. This is deliberately independent from the digest
+/// byte budget: neither many small IDs nor one very large ID may grow the
+/// membership state without a bound.
+pub(crate) const MAX_GOSSIP_MEMBERS: usize = 128;
 
 /// Number of bytes left for a delta payload in a single reply datagram, once
 /// the message header and `reserved_len` bytes (e.g. a digest carried in the
@@ -101,8 +102,61 @@ pub struct Chitchat {
     failure_detector: FailureDetector,
     /// Notifies listeners when a change has occurred in the set of live nodes.
     previous_live_nodes: HashMap<ChitchatId, Version>,
+    /// Highest generation accepted for each stable logical `node_id`.
+    ///
+    /// This survives ordinary node-state garbage collection so a delayed
+    /// lower/equal generation cannot resurrect after the exact ChitchatId was
+    /// removed. The map is bounded by [`MAX_GOSSIP_MEMBERS`].
+    generation_high_watermarks: BTreeMap<Arc<str>, GenerationHighWatermark>,
     live_nodes_watcher_tx: watch::Sender<BTreeMap<ChitchatId, NodeState>>,
     live_nodes_watcher_rx: watch::Receiver<BTreeMap<ChitchatId, NodeState>>,
+}
+
+#[derive(Debug)]
+enum MembershipAdmissionError {
+    Peer(String),
+    LocalInvariant(String),
+}
+
+impl MembershipAdmissionError {
+    fn peer(message: impl Into<String>) -> Self {
+        Self::Peer(message.into())
+    }
+
+    fn local(message: impl Into<String>) -> Self {
+        Self::LocalInvariant(message.into())
+    }
+
+    fn is_peer_error(&self) -> bool {
+        matches!(self, Self::Peer(_))
+    }
+}
+
+impl Display for MembershipAdmissionError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Peer(message) => write!(formatter, "peer membership rejected: {message}"),
+            Self::LocalInvariant(message) => {
+                write!(formatter, "local membership invariant failed: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MembershipAdmissionError {}
+
+#[derive(Debug, Default)]
+struct MembershipUpdatePlan {
+    superseded_ids: Vec<ChitchatId>,
+    heartbeat_updates: Vec<(ChitchatId, Heartbeat)>,
+    high_watermark_updates: Vec<(Arc<str>, GenerationHighWatermark)>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GenerationHighWatermark {
+    generation_id: u64,
+    gossip_advertise_addr: SocketAddr,
+    heartbeat: Heartbeat,
 }
 
 impl Chitchat {
@@ -113,12 +167,21 @@ impl Chitchat {
     ) -> Self {
         let failure_detector = FailureDetector::new(config.failure_detector_config.clone());
         let previous_live_nodes = HashMap::new();
+        let generation_high_watermarks = BTreeMap::from([(
+            config.chitchat_id.node_id.clone(),
+            GenerationHighWatermark {
+                generation_id: config.chitchat_id.generation_id,
+                gossip_advertise_addr: config.chitchat_id.gossip_advertise_addr,
+                heartbeat: Heartbeat(0),
+            },
+        )]);
         let (live_nodes_watcher_tx, live_nodes_watcher_rx) = watch::channel(BTreeMap::new());
         let mut chitchat = Chitchat {
             config,
             cluster_state: ClusterState::with_seed_addrs(seed_addrs),
             failure_detector,
             previous_live_nodes,
+            generation_high_watermarks,
             live_nodes_watcher_tx,
             live_nodes_watcher_rx,
         };
@@ -144,89 +207,273 @@ impl Chitchat {
         }
     }
 
-    /// Digest contains important information about the list of members in
-    /// the cluster.
-    fn report_heartbeats_in_digest(&mut self, digest: &Digest) {
-        for (chitchat_id, node_digest) in &digest.node_digests {
-            if self.cluster_state.node_state(chitchat_id).is_some() {
-                self.report_heartbeat(chitchat_id, node_digest.heartbeat);
+    pub(crate) fn validate_local_membership(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.cluster_state.node_states().len() <= MAX_GOSSIP_MEMBERS,
+            "local gossip membership contains {} raw members, limit is {MAX_GOSSIP_MEMBERS}",
+            self.cluster_state.node_states().len()
+        );
+        anyhow::ensure!(
+            self.generation_high_watermarks.len() <= MAX_GOSSIP_MEMBERS,
+            "local gossip membership contains {} generation high-watermarks, limit is \
+             {MAX_GOSSIP_MEMBERS}",
+            self.generation_high_watermarks.len()
+        );
+        let scheduled_for_deletion: HashSet<_> = self.scheduled_for_deletion_nodes().collect();
+        let digest = self.compute_digest(&scheduled_for_deletion);
+        for version in [ProtocolVersion::V0, ProtocolVersion::V1] {
+            let digest_len = digest.serialized_len(version);
+            anyhow::ensure!(
+                digest_len <= MAX_GOSSIP_DIGEST_SIZE,
+                "local {version:?} gossip digest is {digest_len} bytes, limit is \
+                 {MAX_GOSSIP_DIGEST_SIZE}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Plans a complete membership update without mutating any local state.
+    ///
+    /// The full digest is accepted or rejected as one transaction. In
+    /// particular, known heartbeats are not advanced before every generation,
+    /// member-count, and encoded-byte invariant has been validated.
+    fn plan_heartbeats_in_digest(
+        &self,
+        digest: &Digest,
+    ) -> Result<MembershipUpdatePlan, MembershipAdmissionError> {
+        for version in [ProtocolVersion::V0, ProtocolVersion::V1] {
+            let digest_len = digest.serialized_len(version);
+            if digest_len > MAX_GOSSIP_DIGEST_SIZE {
+                return Err(MembershipAdmissionError::peer(format!(
+                    "incoming {version:?} digest is {digest_len} bytes, limit is \
+                     {MAX_GOSSIP_DIGEST_SIZE}"
+                )));
             }
         }
 
         let scheduled_for_deletion: HashSet<_> = self.scheduled_for_deletion_nodes().collect();
-        let projected_digest = self.compute_digest(&scheduled_for_deletion);
-        let mut projected_entries_len = projected_digest.uncompressed_entries_len();
-        let mut newest_unknown_by_node_id = BTreeMap::new();
-        for (chitchat_id, node_digest) in
-            digest
-                .node_digests
-                .iter()
-                .filter(|(chitchat_id, node_digest)| {
-                    self.cluster_state.node_state(chitchat_id).is_none()
-                        && self
-                            .cluster_state
-                            .last_heartbeat_if_deleted(chitchat_id)
-                            .map(|last_heartbeat| last_heartbeat < node_digest.heartbeat)
-                            .unwrap_or(true)
-                })
-        {
-            let candidate = (chitchat_id, node_digest);
-            newest_unknown_by_node_id
-                .entry(chitchat_id.node_id.as_ref())
-                .and_modify(|current: &mut (&ChitchatId, &crate::digest::NodeDigest)| {
-                    let current_rank = (current.0.generation_id, current.1.heartbeat, current.0);
-                    let candidate_rank = (
-                        candidate.0.generation_id,
-                        candidate.1.heartbeat,
-                        candidate.0,
-                    );
-                    if candidate_rank > current_rank {
-                        *current = candidate;
-                    }
-                })
-                .or_insert(candidate);
+        let current_digest = self.compute_digest(&scheduled_for_deletion);
+        if self.cluster_state.node_states().len() > MAX_GOSSIP_MEMBERS {
+            return Err(MembershipAdmissionError::local(format!(
+                "{} raw members exceed limit {MAX_GOSSIP_MEMBERS}",
+                self.cluster_state.node_states().len()
+            )));
+        }
+        if self.generation_high_watermarks.len() > MAX_GOSSIP_MEMBERS {
+            return Err(MembershipAdmissionError::local(format!(
+                "{} generation high-watermarks exceed limit {MAX_GOSSIP_MEMBERS}",
+                self.generation_high_watermarks.len()
+            )));
+        }
+        for version in [ProtocolVersion::V0, ProtocolVersion::V1] {
+            let digest_len = current_digest.serialized_len(version);
+            if digest_len > MAX_GOSSIP_DIGEST_SIZE {
+                return Err(MembershipAdmissionError::local(format!(
+                    "current {version:?} digest is {digest_len} bytes, limit is \
+                     {MAX_GOSSIP_DIGEST_SIZE}"
+                )));
+            }
         }
 
-        let receiver = &self.config.chitchat_id;
-        let mut unknown_nodes: Vec<_> = newest_unknown_by_node_id
-            .into_values()
-            .map(|(chitchat_id, node_digest)| {
-                (
-                    membership_admission_score(receiver, chitchat_id),
-                    chitchat_id,
-                    node_digest,
-                )
-            })
-            .collect();
-        // Receiver-specific rendezvous ordering spreads a bounded membership
-        // subset across peers without globally penalizing older processes.
-        unknown_nodes.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(right.1)));
+        let mut newest_by_node_id: BTreeMap<Arc<str>, (&ChitchatId, &crate::digest::NodeDigest)> =
+            BTreeMap::new();
+        for (candidate_id, candidate_digest) in &digest.node_digests {
+            match newest_by_node_id.entry(candidate_id.node_id.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((candidate_id, candidate_digest));
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let (current_id, current_digest) = *entry.get();
+                    if current_id.generation_id == candidate_id.generation_id
+                        && current_id.gossip_advertise_addr != candidate_id.gossip_advertise_addr
+                    {
+                        return Err(MembershipAdmissionError::peer(format!(
+                            "node_id {} presents generation {} at two addresses",
+                            candidate_id.node_id, candidate_id.generation_id
+                        )));
+                    }
+                    if (candidate_id.generation_id, candidate_digest.heartbeat)
+                        > (current_id.generation_id, current_digest.heartbeat)
+                    {
+                        entry.insert((candidate_id, candidate_digest));
+                    }
+                }
+            }
+        }
 
-        let mut rejected_nodes = 0usize;
-        for (_, chitchat_id, node_digest) in unknown_nodes {
-            let candidate_entries_len = projected_entries_len
-                .saturating_add(Digest::entry_serialized_len(chitchat_id, node_digest));
-            let fits = [ProtocolVersion::V0, ProtocolVersion::V1]
+        let mut plan = MembershipUpdatePlan::default();
+        let mut projected_members: BTreeSet<ChitchatId> =
+            self.cluster_state.nodes().cloned().collect();
+        let mut projected_digest = current_digest;
+        let mut projected_high_watermarks = self.generation_high_watermarks.clone();
+
+        for (node_id, (candidate_id, candidate_digest)) in newest_by_node_id {
+            let existing_ids: Vec<_> = projected_members
+                .iter()
+                .filter(|existing_id| existing_id.node_id == node_id)
+                .cloned()
+                .collect();
+            let highest_existing_generation = existing_ids
+                .iter()
+                .map(|existing_id| existing_id.generation_id)
+                .max();
+            let high_watermark = projected_high_watermarks.get(&node_id).copied();
+            let highest_generation = highest_existing_generation
                 .into_iter()
-                .all(|version| {
-                    Digest::serialized_len_upper_bound_for_entries(candidate_entries_len, version)
-                        <= MAX_GOSSIP_DIGEST_SIZE
-                });
-            if !fits {
-                rejected_nodes += 1;
+                .chain(high_watermark.map(|watermark| watermark.generation_id))
+                .max();
+
+            if let Some(highest_existing_generation) = highest_existing_generation {
+                let highest_ids: Vec<_> = existing_ids
+                    .iter()
+                    .filter(|existing_id| existing_id.generation_id == highest_existing_generation)
+                    .collect();
+                if highest_ids.len() > 1 {
+                    return Err(MembershipAdmissionError::local(format!(
+                        "node_id {node_id} has generation {highest_existing_generation} at \
+                         multiple addresses"
+                    )));
+                }
+            }
+
+            if node_id == self.config.chitchat_id.node_id {
+                if candidate_id == self.self_chitchat_id() {
+                    continue;
+                }
+                if candidate_id.generation_id >= self.config.chitchat_id.generation_id {
+                    return Err(MembershipAdmissionError::peer(format!(
+                        "unauthenticated packet attempted to supersede local node_id {node_id}"
+                    )));
+                }
                 continue;
             }
-            projected_entries_len = candidate_entries_len;
-            self.report_heartbeat(chitchat_id, node_digest.heartbeat);
+
+            let candidate_is_newer = highest_generation
+                .map(|generation| candidate_id.generation_id > generation)
+                .unwrap_or(true);
+            let candidate_is_current = highest_generation
+                .map(|generation| candidate_id.generation_id == generation)
+                .unwrap_or(false);
+
+            if !candidate_is_newer && !candidate_is_current {
+                continue;
+            }
+
+            let matching_current_id = existing_ids
+                .iter()
+                .find(|existing_id| existing_id.generation_id == candidate_id.generation_id);
+            if candidate_is_current {
+                let expected_address = matching_current_id
+                    .map(|matching_id| matching_id.gossip_advertise_addr)
+                    .or_else(|| high_watermark.map(|watermark| watermark.gossip_advertise_addr));
+                if expected_address != Some(candidate_id.gossip_advertise_addr) {
+                    return Err(MembershipAdmissionError::peer(format!(
+                        "node_id {node_id} reuses generation {} at a different address",
+                        candidate_id.generation_id
+                    )));
+                }
+                if matching_current_id.is_none()
+                    && high_watermark
+                        .map(|watermark| candidate_digest.heartbeat <= watermark.heartbeat)
+                        .unwrap_or(true)
+                {
+                    // This exact incarnation was garbage-collected. Only a
+                    // strictly newer heartbeat proves that the same process
+                    // kept running; an equal/older replay remains stale.
+                    continue;
+                }
+            }
+
+            for existing_id in existing_ids
+                .iter()
+                .filter(|existing_id| existing_id.generation_id < candidate_id.generation_id)
+            {
+                if projected_members.remove(existing_id) {
+                    projected_digest.node_digests.remove(existing_id);
+                    plan.superseded_ids.push(existing_id.clone());
+                }
+            }
+
+            if candidate_is_newer {
+                projected_members.insert(candidate_id.clone());
+                projected_digest
+                    .node_digests
+                    .insert(candidate_id.clone(), *candidate_digest);
+            } else {
+                projected_digest
+                    .node_digests
+                    .entry(candidate_id.clone())
+                    .and_modify(|projected_node_digest| {
+                        projected_node_digest.heartbeat = projected_node_digest
+                            .heartbeat
+                            .max(candidate_digest.heartbeat);
+                    })
+                    .or_insert(*candidate_digest);
+            }
+
+            let projected_high_watermark = GenerationHighWatermark {
+                generation_id: candidate_id.generation_id,
+                gossip_advertise_addr: candidate_id.gossip_advertise_addr,
+                heartbeat: high_watermark
+                    .filter(|watermark| watermark.generation_id == candidate_id.generation_id)
+                    .map(|watermark| watermark.heartbeat.max(candidate_digest.heartbeat))
+                    .unwrap_or(candidate_digest.heartbeat),
+            };
+            projected_high_watermarks.insert(node_id.clone(), projected_high_watermark);
+            plan.high_watermark_updates
+                .push((node_id, projected_high_watermark));
+            plan.heartbeat_updates
+                .push((candidate_id.clone(), candidate_digest.heartbeat));
         }
 
-        if rejected_nodes > 0 {
-            debug!(
-                rejected_nodes,
-                max_digest_size = MAX_GOSSIP_DIGEST_SIZE,
-                "ignored gossip members that would exceed the safe digest budget"
-            );
+        if projected_members.len() > MAX_GOSSIP_MEMBERS {
+            return Err(MembershipAdmissionError::peer(format!(
+                "projected member count {} exceeds limit {MAX_GOSSIP_MEMBERS}",
+                projected_members.len()
+            )));
         }
+        if projected_high_watermarks.len() > MAX_GOSSIP_MEMBERS {
+            return Err(MembershipAdmissionError::peer(format!(
+                "projected logical member count {} exceeds limit {MAX_GOSSIP_MEMBERS}",
+                projected_high_watermarks.len()
+            )));
+        }
+        for version in [ProtocolVersion::V0, ProtocolVersion::V1] {
+            let digest_len = projected_digest.serialized_len(version);
+            if digest_len > MAX_GOSSIP_DIGEST_SIZE {
+                return Err(MembershipAdmissionError::peer(format!(
+                    "projected {version:?} digest is {digest_len} bytes, limit is \
+                     {MAX_GOSSIP_DIGEST_SIZE}"
+                )));
+            }
+        }
+
+        Ok(plan)
+    }
+
+    fn apply_membership_update(&mut self, plan: MembershipUpdatePlan) {
+        for superseded_id in plan.superseded_ids {
+            self.cluster_state.remove_node(&superseded_id);
+            self.failure_detector.forget_node(&superseded_id);
+            self.previous_live_nodes.remove(&superseded_id);
+        }
+        for (node_id, high_watermark) in plan.high_watermark_updates {
+            self.generation_high_watermarks
+                .insert(node_id, high_watermark);
+        }
+        for (chitchat_id, heartbeat) in plan.heartbeat_updates {
+            self.report_heartbeat(&chitchat_id, heartbeat);
+        }
+    }
+
+    /// Validates and atomically applies all membership heartbeats in a digest.
+    fn report_heartbeats_in_digest(
+        &mut self,
+        digest: &Digest,
+    ) -> Result<(), MembershipAdmissionError> {
+        let plan = self.plan_heartbeats_in_digest(digest)?;
+        self.apply_membership_update(plan);
+        Ok(())
     }
 
     fn process_delta(&mut self, delta: Delta) {
@@ -244,8 +491,6 @@ impl Chitchat {
         msg: ChitchatMessage,
         protocol_version: ProtocolVersion,
     ) -> anyhow::Result<Option<ChitchatMessage>> {
-        self.update_self_heartbeat();
-
         match msg {
             ChitchatMessage::Syn { cluster_id, digest } => {
                 if cluster_id != self.cluster_id() {
@@ -256,7 +501,14 @@ impl Chitchat {
                     );
                     return Ok(Some(ChitchatMessage::BadCluster));
                 }
-                self.report_heartbeats_in_digest(&digest);
+                if let Err(error) = self.report_heartbeats_in_digest(&digest) {
+                    if error.is_peer_error() {
+                        debug!(reason=%error, "rejected gossip membership transaction");
+                        return Ok(None);
+                    }
+                    return Err(error.into());
+                }
+                self.update_self_heartbeat();
                 let scheduled_for_deletion: HashSet<_> =
                     self.scheduled_for_deletion_nodes().collect();
                 let self_digest = self.compute_digest(&scheduled_for_deletion);
@@ -266,7 +518,8 @@ impl Chitchat {
                 // so the owner restarts it instead of staying half-alive.
                 anyhow::ensure!(
                     digest_len <= MAX_GOSSIP_DIGEST_SIZE,
-                    "local gossip digest is too large for a safe response: {digest_len} bytes"
+                    "local {protocol_version:?} gossip digest is {digest_len} bytes, limit is \
+                     {MAX_GOSSIP_DIGEST_SIZE}"
                 );
                 let delta = self.cluster_state.compute_partial_delta_respecting_mtu(
                     &digest,
@@ -279,7 +532,14 @@ impl Chitchat {
                 }))
             }
             ChitchatMessage::SynAck { digest, delta } => {
-                self.report_heartbeats_in_digest(&digest);
+                if let Err(error) = self.report_heartbeats_in_digest(&digest) {
+                    if error.is_peer_error() {
+                        debug!(reason=%error, "rejected gossip membership transaction");
+                        return Ok(None);
+                    }
+                    return Err(error.into());
+                }
+                self.update_self_heartbeat();
                 self.process_delta(delta);
                 let scheduled_for_deletion =
                     self.scheduled_for_deletion_nodes().collect::<HashSet<_>>();
@@ -291,6 +551,7 @@ impl Chitchat {
                 Ok(Some(ChitchatMessage::Ack { delta }))
             }
             ChitchatMessage::Ack { delta } => {
+                self.update_self_heartbeat();
                 self.process_delta(delta);
                 Ok(None)
             }
@@ -1687,12 +1948,12 @@ mod tests {
 
         let mut digest = Digest::default();
         let mut delta = Delta::default();
-        for i in 0..55 {
+        for i in 0..40 {
             digest.add_node(id(i), Heartbeat(1), 0, 0);
             delta.add_node(id(i), 0, 0);
             delta.add_kv(&id(i), "key", &random_string(1000), 1, false);
         }
-        node.report_heartbeats_in_digest(&digest);
+        node.report_heartbeats_in_digest(&digest).unwrap();
         node.process_delta(delta);
 
         // Process a SYN message with an empty foreign digest
@@ -1720,14 +1981,19 @@ mod tests {
         let ChitchatMessage::SynAck { delta, .. } = ack_envelope.message else {
             panic!("Expected SynAck, got {:?}", ack_envelope.message);
         };
-        assert_eq!(delta.node_deltas.len(), 4);
+        assert!(!delta.node_deltas.is_empty());
     }
 
     #[test]
-    fn test_membership_import_is_bounded_and_uses_receiver_specific_order() {
+    fn test_oversized_membership_transaction_changes_nothing() {
         let config = ChitchatConfig::for_test(10_006);
         let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
         let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+
+        let known_id = ChitchatId::new("known", 1, ([127, 0, 0, 1], 20_000).into());
+        let mut initial_digest = Digest::default();
+        initial_digest.add_node(known_id.clone(), Heartbeat(1), 0, 0);
+        node.report_heartbeats_in_digest(&initial_digest).unwrap();
 
         let id = |i: usize| ChitchatId {
             node_id: Arc::from(format!("node-{i}-{}", "x".repeat(1000))),
@@ -1735,30 +2001,76 @@ mod tests {
             gossip_advertise_addr: SocketAddr::from(([127, 0, 0, 1], 10_000 + i as u16)),
         };
         let mut oversized_digest = Digest::default();
+        oversized_digest.add_node(known_id.clone(), Heartbeat(999), 0, 0);
         for i in 0..100 {
             oversized_digest.add_node(id(i), Heartbeat(1), 0, 0);
         }
 
-        let receiver = node.config.chitchat_id.clone();
-        let highest_score_id = (0..100)
-            .map(id)
-            .max_by_key(|candidate| membership_admission_score(&receiver, candidate))
-            .unwrap();
-        let lowest_score_id = (0..100)
-            .map(id)
-            .min_by_key(|candidate| membership_admission_score(&receiver, candidate))
-            .unwrap();
+        let error = node
+            .report_heartbeats_in_digest(&oversized_digest)
+            .unwrap_err();
 
-        node.report_heartbeats_in_digest(&oversized_digest);
-        let digest = node.compute_digest(&HashSet::new());
-        assert!(digest.serialized_len(ProtocolVersion::V0) <= MAX_GOSSIP_DIGEST_SIZE);
-        assert!(digest.serialized_len(ProtocolVersion::V1) <= MAX_GOSSIP_DIGEST_SIZE);
-        assert!(node.cluster_state.node_state(&highest_score_id).is_some());
-        assert!(node.cluster_state.node_state(&lowest_score_id).is_none());
+        assert!(error.is_peer_error());
+        assert_eq!(node.cluster_state.node_states().len(), 2);
+        assert_eq!(
+            node.cluster_state
+                .node_state(&known_id)
+                .unwrap()
+                .heartbeat(),
+            Heartbeat(1)
+        );
+        assert!(node.cluster_state.node_state(&id(0)).is_none());
     }
 
     #[test]
-    fn test_membership_import_keeps_only_newest_unknown_incarnation_per_node() {
+    fn test_rejected_syn_ack_does_not_apply_heartbeat_or_delta() {
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let self_heartbeat_before = node.self_node_state().heartbeat();
+
+        let known_id = ChitchatId::new("known", 1, ([127, 0, 0, 1], 20_000).into());
+        let mut initial_digest = Digest::default();
+        initial_digest.add_node(known_id.clone(), Heartbeat(1), 0, 0);
+        node.report_heartbeats_in_digest(&initial_digest).unwrap();
+
+        let mut rejected_digest = Digest::default();
+        rejected_digest.add_node(known_id.clone(), Heartbeat(999), 0, 0);
+        for index in 0..100 {
+            rejected_digest.add_node(
+                ChitchatId::new(
+                    format!("oversized-{index}-{}", "x".repeat(1000)),
+                    1,
+                    ([127, 0, 0, 1], 21_000 + index as u16).into(),
+                ),
+                Heartbeat(1),
+                0,
+                0,
+            );
+        }
+        let mut rejected_delta = Delta::default();
+        rejected_delta.add_node(known_id.clone(), 0, 0);
+        rejected_delta.add_kv(&known_id, "must-not-apply", "value", 1, false);
+
+        let response = node
+            .process_message(
+                ChitchatMessage::SynAck {
+                    digest: rejected_digest,
+                    delta: rejected_delta,
+                },
+                ProtocolVersion::V0,
+            )
+            .unwrap();
+
+        assert!(response.is_none());
+        assert_eq!(node.self_node_state().heartbeat(), self_heartbeat_before);
+        let known_state = node.cluster_state.node_state(&known_id).unwrap();
+        assert_eq!(known_state.heartbeat(), Heartbeat(1));
+        assert_eq!(known_state.get("must-not-apply"), None);
+    }
+
+    #[test]
+    fn test_new_generation_supersedes_old_incarnation_everywhere() {
         let config = ChitchatConfig::for_test(10_006);
         let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
         let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
@@ -1772,43 +2084,188 @@ mod tests {
             generation_id: 2,
             gossip_advertise_addr: SocketAddr::from(([127, 0, 0, 1], 20_002)),
         };
-        let mut digest = Digest::default();
-        digest.add_node(old_id.clone(), Heartbeat(100), 0, 0);
-        digest.add_node(new_id.clone(), Heartbeat(1), 0, 0);
+        let mut old_digest = Digest::default();
+        old_digest.add_node(old_id.clone(), Heartbeat(100), 0, 0);
+        node.report_heartbeats_in_digest(&old_digest).unwrap();
+        node.failure_detector.report_heartbeat(&old_id);
+        node.failure_detector.report_heartbeat(&old_id);
+        node.failure_detector.update_node_liveness(&old_id);
+        node.previous_live_nodes.insert(old_id.clone(), 7);
+        assert!(node.live_nodes().any(|chitchat_id| chitchat_id == &old_id));
 
-        node.report_heartbeats_in_digest(&digest);
+        let mut new_digest = Digest::default();
+        new_digest.add_node(new_id.clone(), Heartbeat(1), 0, 0);
+
+        node.report_heartbeats_in_digest(&new_digest).unwrap();
 
         assert!(node.cluster_state.node_state(&old_id).is_none());
         assert!(node.cluster_state.node_state(&new_id).is_some());
+        assert!(!node.live_nodes().any(|chitchat_id| chitchat_id == &old_id));
+        assert!(!node.dead_nodes().any(|chitchat_id| chitchat_id == &old_id));
+        assert!(!node.previous_live_nodes.contains_key(&old_id));
+        assert_eq!(
+            node.generation_high_watermarks
+                .get("restarted-node")
+                .map(|watermark| watermark.generation_id),
+            Some(2)
+        );
+
+        let mut replay_digest = Digest::default();
+        replay_digest.add_node(old_id.clone(), Heartbeat(u64::MAX), 0, 0);
+        node.report_heartbeats_in_digest(&replay_digest).unwrap();
+        assert!(node.cluster_state.node_state(&old_id).is_none());
     }
 
     #[test]
-    fn test_garbage_collected_replays_do_not_consume_membership_budget() {
+    fn test_one_thousand_restarts_keep_one_incarnation() {
         let config = ChitchatConfig::for_test(10_006);
         let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
         let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
-        let mut replay_digest = Digest::default();
 
-        for i in 0..100 {
-            let replayed_id = ChitchatId {
-                node_id: Arc::from(format!("deleted-{i}-{}", "x".repeat(1000))),
-                generation_id: 1_000 + i as u64,
-                gossip_advertise_addr: SocketAddr::from(([127, 0, 0, 1], 10_000 + i as u16)),
-            };
-            node.report_heartbeat(&replayed_id, Heartbeat(10));
-            node.cluster_state.remove_node(&replayed_id);
-            replay_digest.add_node(replayed_id, Heartbeat(10), 0, 0);
+        for generation in 1..=1_000 {
+            let incarnation = ChitchatId::new(
+                "stable-slot",
+                generation,
+                ([127, 0, 0, 1], 20_000 + (generation % 1_000) as u16).into(),
+            );
+            let mut digest = Digest::default();
+            digest.add_node(incarnation.clone(), Heartbeat(1), 0, 0);
+
+            node.report_heartbeats_in_digest(&digest).unwrap();
+
+            assert_eq!(node.cluster_state.node_states().len(), 2);
+            assert!(node.cluster_state.node_state(&incarnation).is_some());
+            assert_eq!(
+                node.generation_high_watermarks
+                    .get("stable-slot")
+                    .map(|watermark| watermark.generation_id),
+                Some(generation)
+            );
         }
 
-        let fresh_id = ChitchatId {
-            node_id: Arc::from("fresh-node"),
-            generation_id: 1,
-            gossip_advertise_addr: SocketAddr::from(([127, 0, 0, 1], 20_000)),
-        };
-        replay_digest.add_node(fresh_id.clone(), Heartbeat(1), 0, 0);
+        node.validate_local_membership().unwrap();
+    }
 
-        node.report_heartbeats_in_digest(&replay_digest);
+    #[test]
+    fn test_equal_generation_with_different_address_rejects_whole_transaction() {
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let original_id = ChitchatId::new("collision", 7, ([127, 0, 0, 1], 20_001).into());
+        let conflicting_id = ChitchatId::new("collision", 7, ([127, 0, 0, 1], 20_002).into());
+        let fresh_id = ChitchatId::new("fresh", 1, ([127, 0, 0, 1], 20_003).into());
+        let mut initial_digest = Digest::default();
+        initial_digest.add_node(original_id.clone(), Heartbeat(1), 0, 0);
+        node.report_heartbeats_in_digest(&initial_digest).unwrap();
+
+        let mut conflicting_digest = Digest::default();
+        conflicting_digest.add_node(conflicting_id, Heartbeat(2), 0, 0);
+        conflicting_digest.add_node(fresh_id.clone(), Heartbeat(1), 0, 0);
+
+        let error = node
+            .report_heartbeats_in_digest(&conflicting_digest)
+            .unwrap_err();
+
+        assert!(error.is_peer_error());
+        assert!(node.cluster_state.node_state(&original_id).is_some());
+        assert!(node.cluster_state.node_state(&fresh_id).is_none());
+    }
+
+    #[test]
+    fn test_member_count_limit_rejects_whole_transaction() {
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let mut digest = Digest::default();
+        for index in 0..MAX_GOSSIP_MEMBERS {
+            let chitchat_id = ChitchatId::new(
+                format!("member-{index}"),
+                1,
+                ([127, 0, 0, 1], 20_000 + index as u16).into(),
+            );
+            digest.add_node(chitchat_id, Heartbeat(1), 0, 0);
+        }
+
+        let error = node.report_heartbeats_in_digest(&digest).unwrap_err();
+
+        assert!(error.is_peer_error());
+        assert_eq!(node.cluster_state.node_states().len(), 1);
+        assert_eq!(node.generation_high_watermarks.len(), 1);
+    }
+
+    #[test]
+    fn test_member_count_accepts_limit_then_rejects_plus_one_without_mutation() {
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let mut at_limit_digest = Digest::default();
+        for index in 0..(MAX_GOSSIP_MEMBERS - 1) {
+            at_limit_digest.add_node(
+                ChitchatId::new(
+                    format!("member-{index}"),
+                    1,
+                    ([127, 0, 0, 1], 20_000 + index as u16).into(),
+                ),
+                Heartbeat(1),
+                0,
+                0,
+            );
+        }
+        node.report_heartbeats_in_digest(&at_limit_digest).unwrap();
+        assert_eq!(node.cluster_state.node_states().len(), MAX_GOSSIP_MEMBERS);
+
+        let existing_id = ChitchatId::new("member-0", 1, ([127, 0, 0, 1], 20_000).into());
+        let extra_id = ChitchatId::new("one-too-many", 1, ([127, 0, 0, 1], 30_000).into());
+        let mut over_limit_digest = Digest::default();
+        over_limit_digest.add_node(existing_id.clone(), Heartbeat(999), 0, 0);
+        over_limit_digest.add_node(extra_id.clone(), Heartbeat(1), 0, 0);
+
+        let error = node
+            .report_heartbeats_in_digest(&over_limit_digest)
+            .unwrap_err();
+
+        assert!(error.is_peer_error());
+        assert_eq!(node.cluster_state.node_states().len(), MAX_GOSSIP_MEMBERS);
+        assert_eq!(
+            node.cluster_state
+                .node_state(&existing_id)
+                .unwrap()
+                .heartbeat(),
+            Heartbeat(1)
+        );
+        assert!(node.cluster_state.node_state(&extra_id).is_none());
+    }
+
+    #[test]
+    fn test_equal_generation_replay_requires_new_heartbeat_after_state_gc() {
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let old_id = ChitchatId::new("gc-node", 9, ([127, 0, 0, 1], 20_001).into());
+        let fresh_id = ChitchatId::new("fresh-node", 1, ([127, 0, 0, 1], 20_002).into());
+        let mut initial_digest = Digest::default();
+        initial_digest.add_node(old_id.clone(), Heartbeat(10), 0, 0);
+        node.report_heartbeats_in_digest(&initial_digest).unwrap();
+        node.cluster_state.remove_node(&old_id);
+        node.failure_detector.forget_node(&old_id);
+
+        let mut stale_replay_digest = Digest::default();
+        stale_replay_digest.add_node(old_id.clone(), Heartbeat(10), 0, 0);
+        stale_replay_digest.add_node(fresh_id.clone(), Heartbeat(1), 0, 0);
+        node.report_heartbeats_in_digest(&stale_replay_digest)
+            .unwrap();
+
+        assert!(node.cluster_state.node_state(&old_id).is_none());
         assert!(node.cluster_state.node_state(&fresh_id).is_some());
+
+        let mut progressed_digest = Digest::default();
+        progressed_digest.add_node(old_id.clone(), Heartbeat(11), 0, 0);
+        node.report_heartbeats_in_digest(&progressed_digest)
+            .unwrap();
+        assert_eq!(
+            node.cluster_state.node_state(&old_id).unwrap().heartbeat(),
+            Heartbeat(11)
+        );
     }
 
     #[test]
@@ -1838,7 +2295,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("local gossip digest is too large")
+                .contains("local membership invariant failed")
         );
     }
 

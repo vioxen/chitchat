@@ -13,7 +13,7 @@ use tokio::task::JoinHandle;
 use tokio::time;
 use tracing::{debug, warn};
 
-use crate::message::{ChitchatEnvelope, ChitchatMessage};
+use crate::message::ChitchatEnvelope;
 use crate::transport::{RecvOutcome, Socket, Transport};
 use crate::{Chitchat, ChitchatConfig, ChitchatId};
 
@@ -333,18 +333,10 @@ impl Server {
 
         chitchat_guard.update_self_heartbeat();
         chitchat_guard.gc_keys_marked_for_deletion();
-        let protocol_version = chitchat_guard.config.protocol_version;
-        let local_digest_len = match chitchat_guard.create_syn_message() {
-            ChitchatMessage::Syn { digest, .. } => digest.serialized_len(protocol_version),
-            _ => unreachable!("create_syn_message must return a SYN"),
-        };
-        // An oversized local digest is a corrupted membership invariant. Stop
-        // the supervised runtime so its owner can restart with fresh state;
-        // continuing would look healthy while every gossip reply is unsafe.
-        anyhow::ensure!(
-            local_digest_len <= crate::MAX_GOSSIP_DIGEST_SIZE,
-            "local gossip digest is too large for safe publication: {local_digest_len} bytes"
-        );
+        // A broken local member-count or byte-budget invariant is supervised
+        // as a fatal runtime error. Peer-controlled invalid input is rejected
+        // before mutation in `process_message` and never reaches this path.
+        chitchat_guard.validate_local_membership()?;
 
         // Drop lock to prevent deadlock in [`UdpSocket::gossip`].
         drop(chitchat_guard);
@@ -970,7 +962,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("local gossip digest is too large")
+                .contains("local membership invariant failed")
         );
         server_handle.shutdown().await.unwrap_err();
     }
@@ -989,11 +981,7 @@ mod tests {
                 .await
                 .expect("periodic gossip should detect the invalid local digest")
                 .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("local gossip digest is too large")
-        );
+        assert!(error.to_string().contains("local V0 gossip digest"));
         server_handle.shutdown().await.unwrap_err();
     }
 }

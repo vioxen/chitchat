@@ -93,6 +93,7 @@ impl Digest {
 }
 
 impl Digest {
+    #[cfg(test)]
     pub(crate) fn uncompressed_entries_len(&self) -> usize {
         self.node_digests
             .iter()
@@ -102,13 +103,7 @@ impl Digest {
             .sum()
     }
 
-    pub(crate) fn entry_serialized_len(
-        chitchat_id: &ChitchatId,
-        node_digest: &NodeDigest,
-    ) -> usize {
-        chitchat_id.serialized_len() + node_digest.serialized_len()
-    }
-
+    #[cfg(test)]
     pub(crate) fn serialized_len_upper_bound_for_entries(
         entries_len: usize,
         protocol_version: ProtocolVersion,
