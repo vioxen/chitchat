@@ -26,6 +26,7 @@ use delta::Delta;
 use failure_detector::FailureDetector;
 pub use failure_detector::FailureDetectorConfig;
 pub use listener::ListenerHandle;
+use lru::LruCache;
 pub use serialize::{Deserializable, Serializable};
 use tokio::sync::watch;
 use tokio_stream::wrappers::WatchStream;
@@ -102,12 +103,16 @@ pub struct Chitchat {
     failure_detector: FailureDetector,
     /// Notifies listeners when a change has occurred in the set of live nodes.
     previous_live_nodes: HashMap<ChitchatId, Version>,
-    /// Highest generation accepted for each stable logical `node_id`.
+    /// Recently observed highest generation for each logical `node_id`.
     ///
     /// This survives ordinary node-state garbage collection so a delayed
-    /// lower/equal generation cannot resurrect after the exact ChitchatId was
-    /// removed. The map is bounded by [`MAX_GOSSIP_MEMBERS`].
-    generation_high_watermarks: BTreeMap<Arc<str>, GenerationHighWatermark>,
+    /// lower/equal generation cannot immediately resurrect after the exact
+    /// ChitchatId was removed. It is an LRU history, deliberately separate
+    /// from the concurrent-member limit: churn must not permanently exhaust
+    /// live membership. Stable bounded node IDs make eviction unreachable in
+    /// normal deployments; legacy ephemeral IDs retain the same bounded
+    /// best-effort history semantics as garbage-collected node state.
+    generation_high_watermarks: LruCache<Arc<str>, GenerationHighWatermark>,
     live_nodes_watcher_tx: watch::Sender<BTreeMap<ChitchatId, NodeState>>,
     live_nodes_watcher_rx: watch::Receiver<BTreeMap<ChitchatId, NodeState>>,
 }
@@ -167,14 +172,15 @@ impl Chitchat {
     ) -> Self {
         let failure_detector = FailureDetector::new(config.failure_detector_config.clone());
         let previous_live_nodes = HashMap::new();
-        let generation_high_watermarks = BTreeMap::from([(
+        let mut generation_high_watermarks = LruCache::new(GARBAGE_COLLECTED_NODE_HISTORY_SIZE);
+        generation_high_watermarks.put(
             config.chitchat_id.node_id.clone(),
             GenerationHighWatermark {
                 generation_id: config.chitchat_id.generation_id,
                 gossip_advertise_addr: config.chitchat_id.gossip_advertise_addr,
                 heartbeat: Heartbeat(0),
             },
-        )]);
+        );
         let (live_nodes_watcher_tx, live_nodes_watcher_rx) = watch::channel(BTreeMap::new());
         let mut chitchat = Chitchat {
             config,
@@ -214,10 +220,11 @@ impl Chitchat {
             self.cluster_state.node_states().len()
         );
         anyhow::ensure!(
-            self.generation_high_watermarks.len() <= MAX_GOSSIP_MEMBERS,
-            "local gossip membership contains {} generation high-watermarks, limit is \
-             {MAX_GOSSIP_MEMBERS}",
-            self.generation_high_watermarks.len()
+            self.generation_high_watermarks.len() <= GARBAGE_COLLECTED_NODE_HISTORY_SIZE.get(),
+            "local gossip membership contains {} generation high-watermarks, history limit is \
+             {}",
+            self.generation_high_watermarks.len(),
+            GARBAGE_COLLECTED_NODE_HISTORY_SIZE
         );
         let scheduled_for_deletion: HashSet<_> = self.scheduled_for_deletion_nodes().collect();
         let digest = self.compute_digest(&scheduled_for_deletion);
@@ -259,10 +266,11 @@ impl Chitchat {
                 self.cluster_state.node_states().len()
             )));
         }
-        if self.generation_high_watermarks.len() > MAX_GOSSIP_MEMBERS {
+        if self.generation_high_watermarks.len() > GARBAGE_COLLECTED_NODE_HISTORY_SIZE.get() {
             return Err(MembershipAdmissionError::local(format!(
-                "{} generation high-watermarks exceed limit {MAX_GOSSIP_MEMBERS}",
-                self.generation_high_watermarks.len()
+                "{} generation high-watermarks exceed history limit {}",
+                self.generation_high_watermarks.len(),
+                GARBAGE_COLLECTED_NODE_HISTORY_SIZE
             )));
         }
         for version in [ProtocolVersion::V0, ProtocolVersion::V1] {
@@ -305,8 +313,6 @@ impl Chitchat {
         let mut projected_members: BTreeSet<ChitchatId> =
             self.cluster_state.nodes().cloned().collect();
         let mut projected_digest = current_digest;
-        let mut projected_high_watermarks = self.generation_high_watermarks.clone();
-
         for (node_id, (candidate_id, candidate_digest)) in newest_by_node_id {
             let existing_ids: Vec<_> = projected_members
                 .iter()
@@ -317,7 +323,7 @@ impl Chitchat {
                 .iter()
                 .map(|existing_id| existing_id.generation_id)
                 .max();
-            let high_watermark = projected_high_watermarks.get(&node_id).copied();
+            let high_watermark = self.generation_high_watermarks.peek(&node_id).copied();
             let highest_generation = highest_existing_generation
                 .into_iter()
                 .chain(high_watermark.map(|watermark| watermark.generation_id))
@@ -419,7 +425,6 @@ impl Chitchat {
                     .map(|watermark| watermark.heartbeat.max(candidate_digest.heartbeat))
                     .unwrap_or(candidate_digest.heartbeat),
             };
-            projected_high_watermarks.insert(node_id.clone(), projected_high_watermark);
             plan.high_watermark_updates
                 .push((node_id, projected_high_watermark));
             plan.heartbeat_updates
@@ -430,12 +435,6 @@ impl Chitchat {
             return Err(MembershipAdmissionError::peer(format!(
                 "projected member count {} exceeds limit {MAX_GOSSIP_MEMBERS}",
                 projected_members.len()
-            )));
-        }
-        if projected_high_watermarks.len() > MAX_GOSSIP_MEMBERS {
-            return Err(MembershipAdmissionError::peer(format!(
-                "projected logical member count {} exceeds limit {MAX_GOSSIP_MEMBERS}",
-                projected_high_watermarks.len()
             )));
         }
         for version in [ProtocolVersion::V0, ProtocolVersion::V1] {
@@ -458,8 +457,7 @@ impl Chitchat {
             self.previous_live_nodes.remove(&superseded_id);
         }
         for (node_id, high_watermark) in plan.high_watermark_updates {
-            self.generation_high_watermarks
-                .insert(node_id, high_watermark);
+            self.generation_high_watermarks.put(node_id, high_watermark);
         }
         for (chitchat_id, heartbeat) in plan.heartbeat_updates {
             self.report_heartbeat(&chitchat_id, heartbeat);
@@ -504,7 +502,19 @@ impl Chitchat {
                 if let Err(error) = self.report_heartbeats_in_digest(&digest) {
                     if error.is_peer_error() {
                         debug!(reason=%error, "rejected gossip membership transaction");
-                        return Ok(None);
+                        // Keep the membership transaction all-or-nothing and
+                        // do not derive a delta from the rejected digest. We
+                        // can still return our valid membership view with an
+                        // empty delta so one poisoned entry does not suppress
+                        // the entire handshake between this pair.
+                        self.validate_local_membership()?;
+                        let scheduled_for_deletion: HashSet<_> =
+                            self.scheduled_for_deletion_nodes().collect();
+                        let self_digest = self.compute_digest(&scheduled_for_deletion);
+                        return Ok(Some(ChitchatMessage::SynAck {
+                            digest: self_digest,
+                            delta: Delta::default(),
+                        }));
                     }
                     return Err(error.into());
                 }
@@ -535,7 +545,12 @@ impl Chitchat {
                 if let Err(error) = self.report_heartbeats_in_digest(&digest) {
                     if error.is_peer_error() {
                         debug!(reason=%error, "rejected gossip membership transaction");
-                        return Ok(None);
+                        // Do not apply the peer delta after rejecting its
+                        // membership view, but finish the handshake without
+                        // propagating any state derived from that view.
+                        return Ok(Some(ChitchatMessage::Ack {
+                            delta: Delta::default(),
+                        }));
                     }
                     return Err(error.into());
                 }
@@ -2023,6 +2038,48 @@ mod tests {
     }
 
     #[test]
+    fn test_rejected_syn_returns_local_membership_without_peer_delta() {
+        let config = ChitchatConfig::for_test(10_006);
+        let cluster_id = config.cluster_id.clone();
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let self_id = node.self_chitchat_id().clone();
+        let self_heartbeat_before = node.self_node_state().heartbeat();
+
+        let mut rejected_digest = Digest::default();
+        for index in 0..100 {
+            rejected_digest.add_node(
+                ChitchatId::new(
+                    format!("oversized-{index}-{}", "x".repeat(1000)),
+                    1,
+                    ([127, 0, 0, 1], 21_000 + index as u16).into(),
+                ),
+                Heartbeat(1),
+                0,
+                0,
+            );
+        }
+
+        let response = node
+            .process_message(
+                ChitchatMessage::Syn {
+                    cluster_id,
+                    digest: rejected_digest,
+                },
+                ProtocolVersion::V0,
+            )
+            .unwrap();
+
+        let Some(ChitchatMessage::SynAck { digest, delta }) = response else {
+            panic!("rejected SYN should receive a membership-only SYN-ACK");
+        };
+        assert!(digest.node_digests.contains_key(&self_id));
+        assert_eq!(delta, Delta::default());
+        assert_eq!(node.self_node_state().heartbeat(), self_heartbeat_before);
+        assert_eq!(node.cluster_state.node_states().len(), 1);
+    }
+
+    #[test]
     fn test_rejected_syn_ack_does_not_apply_heartbeat_or_delta() {
         let config = ChitchatConfig::for_test(10_006);
         let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
@@ -2062,7 +2119,12 @@ mod tests {
             )
             .unwrap();
 
-        assert!(response.is_none());
+        assert_eq!(
+            response,
+            Some(ChitchatMessage::Ack {
+                delta: Delta::default()
+            })
+        );
         assert_eq!(node.self_node_state().heartbeat(), self_heartbeat_before);
         let known_state = node.cluster_state.node_state(&known_id).unwrap();
         assert_eq!(known_state.heartbeat(), Heartbeat(1));
@@ -2143,6 +2205,31 @@ mod tests {
             );
         }
 
+        node.validate_local_membership().unwrap();
+    }
+
+    #[test]
+    fn test_historical_node_id_churn_does_not_exhaust_live_member_limit() {
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+
+        for index in 0..=MAX_GOSSIP_MEMBERS {
+            let incarnation = ChitchatId::new(
+                format!("legacy-ephemeral-{index}"),
+                1,
+                ([127, 0, 0, 1], 20_000 + index as u16).into(),
+            );
+            let mut digest = Digest::default();
+            digest.add_node(incarnation.clone(), Heartbeat(1), 0, 0);
+
+            node.report_heartbeats_in_digest(&digest).unwrap();
+            node.cluster_state.remove_node(&incarnation);
+            node.failure_detector.forget_node(&incarnation);
+        }
+
+        assert_eq!(node.cluster_state.node_states().len(), 1);
+        assert!(node.generation_high_watermarks.len() > MAX_GOSSIP_MEMBERS);
         node.validate_local_membership().unwrap();
     }
 
