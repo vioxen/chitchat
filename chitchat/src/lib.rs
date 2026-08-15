@@ -400,8 +400,12 @@ impl Chitchat {
                 }
             }
 
+            // The apply step materializes every accepted heartbeat as a node
+            // state, including a garbage-collected current generation that
+            // proves continued life with a newer heartbeat. Keep the member
+            // and byte projections identical before enforcing either bound.
+            projected_members.insert(candidate_id.clone());
             if candidate_is_newer {
-                projected_members.insert(candidate_id.clone());
                 projected_digest
                     .node_digests
                     .insert(candidate_id.clone(), *candidate_digest);
@@ -2353,6 +2357,51 @@ mod tests {
             node.cluster_state.node_state(&old_id).unwrap().heartbeat(),
             Heartbeat(11)
         );
+    }
+
+    #[test]
+    fn test_current_generation_resurrection_obeys_member_limit() {
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let resurrected_id =
+            ChitchatId::new("resurrected-at-limit", 7, ([127, 0, 0, 1], 20_000).into());
+        let mut at_limit_digest = Digest::default();
+        at_limit_digest.add_node(resurrected_id.clone(), Heartbeat(1), 0, 0);
+        for index in 1..(MAX_GOSSIP_MEMBERS - 1) {
+            at_limit_digest.add_node(
+                ChitchatId::new(
+                    format!("member-{index}"),
+                    1,
+                    ([127, 0, 0, 1], 20_000 + index as u16).into(),
+                ),
+                Heartbeat(1),
+                0,
+                0,
+            );
+        }
+        node.report_heartbeats_in_digest(&at_limit_digest).unwrap();
+        assert_eq!(node.cluster_state.node_states().len(), MAX_GOSSIP_MEMBERS);
+
+        node.cluster_state.remove_node(&resurrected_id);
+        node.failure_detector.forget_node(&resurrected_id);
+        let replacement_id = ChitchatId::new("replacement", 1, ([127, 0, 0, 1], 30_000).into());
+        let mut replacement_digest = Digest::default();
+        replacement_digest.add_node(replacement_id.clone(), Heartbeat(1), 0, 0);
+        node.report_heartbeats_in_digest(&replacement_digest)
+            .unwrap();
+        assert_eq!(node.cluster_state.node_states().len(), MAX_GOSSIP_MEMBERS);
+
+        let mut resurrection_digest = Digest::default();
+        resurrection_digest.add_node(resurrected_id.clone(), Heartbeat(2), 0, 0);
+        let error = node
+            .report_heartbeats_in_digest(&resurrection_digest)
+            .unwrap_err();
+
+        assert!(error.is_peer_error());
+        assert_eq!(node.cluster_state.node_states().len(), MAX_GOSSIP_MEMBERS);
+        assert!(node.cluster_state.node_state(&resurrected_id).is_none());
+        assert!(node.cluster_state.node_state(&replacement_id).is_some());
     }
 
     #[test]
