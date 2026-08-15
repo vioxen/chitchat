@@ -53,6 +53,17 @@ impl FailureDetector {
             .report_heartbeat();
     }
 
+    /// Removes every failure-detector trace of a superseded incarnation.
+    ///
+    /// Membership generation replacement must update the cluster state and
+    /// failure detector together. Leaving an old incarnation in any of these
+    /// collections can make it routable again or keep it in later digests.
+    pub(crate) fn forget_node(&mut self, chitchat_id: &ChitchatId) {
+        self.node_samples.remove(chitchat_id);
+        self.live_nodes.remove(chitchat_id);
+        self.dead_nodes.remove(chitchat_id);
+    }
+
     /// Marks the node as dead or alive based on the current phi value.
     pub fn update_node_liveness(&mut self, chitchat_id: &ChitchatId) {
         let phi_opt = self.phi(chitchat_id);
