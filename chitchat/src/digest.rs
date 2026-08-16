@@ -103,7 +103,6 @@ impl Digest {
             .sum()
     }
 
-    #[cfg(test)]
     pub(crate) fn serialized_len_upper_bound_for_entries(
         entries_len: usize,
         protocol_version: ProtocolVersion,
@@ -189,9 +188,13 @@ impl Digest {
     }
 
     fn deserialize_v1(buf: &mut &[u8]) -> anyhow::Result<Self> {
-        let node_digests = deserialize_stream::<(ChitchatId, NodeDigest)>(buf)?
-            .into_iter()
-            .collect();
+        let node_digests = deserialize_stream_bounded::<(ChitchatId, NodeDigest)>(
+            buf,
+            crate::MAX_GOSSIP_DIGEST_SIZE,
+            MAX_COMPRESSED_STREAM_BLOCK_SIZE,
+        )?
+        .into_iter()
+        .collect();
         Ok(Digest { node_digests })
     }
 }

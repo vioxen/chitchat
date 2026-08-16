@@ -155,6 +155,17 @@ struct MembershipUpdatePlan {
     superseded_ids: Vec<ChitchatId>,
     heartbeat_updates: Vec<(ChitchatId, Heartbeat)>,
     high_watermark_updates: Vec<(Arc<str>, GenerationHighWatermark)>,
+    projected_v0_digest_len: usize,
+}
+
+/// A fully validated inbound transaction. Constructing this value is pure;
+/// only `commit_message_plan` may expose its effects to the live node.
+#[derive(Debug, Default)]
+struct InboundMessagePlan {
+    membership_update: Option<MembershipUpdatePlan>,
+    delta: Option<Delta>,
+    response: Option<ChitchatMessage>,
+    advance_self_heartbeat: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -451,7 +462,31 @@ impl Chitchat {
             }
         }
 
+        plan.projected_v0_digest_len = projected_digest.serialized_len(ProtocolVersion::V0);
+
         Ok(plan)
+    }
+
+    fn validate_syn_ack_response_budget(
+        membership_update: &MembershipUpdatePlan,
+        protocol_version: ProtocolVersion,
+    ) -> Result<(), MembershipAdmissionError> {
+        let digest_len_upper_bound = match protocol_version {
+            ProtocolVersion::V0 => membership_update.projected_v0_digest_len,
+            ProtocolVersion::V1 => Digest::serialized_len_upper_bound_for_entries(
+                membership_update.projected_v0_digest_len.saturating_sub(2),
+                ProtocolVersion::V1,
+            ),
+        };
+        let response_len_upper_bound = ChitchatEnvelope::HEADER_LEN
+            .saturating_add(digest_len_upper_bound)
+            .saturating_add(Delta::default().serialized_len());
+        if response_len_upper_bound > MAX_UDP_DATAGRAM_PAYLOAD_SIZE {
+            return Err(MembershipAdmissionError::peer(format!(
+                "projected {protocol_version:?} SYN-ACK response is {response_len_upper_bound} bytes, limit is {MAX_UDP_DATAGRAM_PAYLOAD_SIZE}"
+            )));
+        }
+        Ok(())
     }
 
     fn apply_membership_update(&mut self, plan: MembershipUpdatePlan) {
@@ -469,6 +504,7 @@ impl Chitchat {
     }
 
     /// Validates and atomically applies all membership heartbeats in a digest.
+    #[cfg(test)]
     fn report_heartbeats_in_digest(
         &mut self,
         digest: &Digest,
@@ -488,6 +524,82 @@ impl Chitchat {
         }
     }
 
+    fn validate_peer_delta(delta: &Delta) -> Result<(), MembershipAdmissionError> {
+        delta
+            .validate()
+            .map_err(|error| MembershipAdmissionError::peer(error.to_string()))
+    }
+
+    /// Proves the exact response envelope fits before exposing any planned
+    /// inbound effect, then performs the infallible commit steps.
+    fn commit_message_plan(
+        &mut self,
+        plan: InboundMessagePlan,
+        protocol_version: ProtocolVersion,
+    ) -> Result<Option<ChitchatMessage>, MembershipAdmissionError> {
+        if let Some(response) = &plan.response {
+            let response_len =
+                ChitchatEnvelope::serialized_len_for_message(protocol_version, response);
+            if response_len > MAX_UDP_DATAGRAM_PAYLOAD_SIZE {
+                return Err(MembershipAdmissionError::peer(format!(
+                    "outgoing {protocol_version:?} response is {response_len} bytes, limit is \
+                     {MAX_UDP_DATAGRAM_PAYLOAD_SIZE}"
+                )));
+            }
+        }
+
+        if let Some(membership_update) = plan.membership_update {
+            self.apply_membership_update(membership_update);
+        }
+        if let Some(delta) = plan.delta {
+            // `validate_peer_delta` proved the assertions in state application
+            // before any part of this packet was committed.
+            self.process_delta(delta);
+        }
+        if plan.advance_self_heartbeat {
+            self.update_self_heartbeat();
+        }
+        Ok(plan.response)
+    }
+
+    fn rejected_syn_response(
+        &mut self,
+        protocol_version: ProtocolVersion,
+    ) -> anyhow::Result<Option<ChitchatMessage>> {
+        self.validate_local_membership().map_err(|error| {
+            MembershipAdmissionError::local(format!("cannot build rejection response: {error}"))
+        })?;
+        let scheduled_for_deletion: HashSet<_> = self.scheduled_for_deletion_nodes().collect();
+        let response = ChitchatMessage::SynAck {
+            digest: self.compute_digest(&scheduled_for_deletion),
+            delta: Delta::default(),
+        };
+        self.commit_message_plan(
+            InboundMessagePlan {
+                response: Some(response),
+                ..Default::default()
+            },
+            protocol_version,
+        )
+        .map_err(Into::into)
+    }
+
+    fn rejected_syn_ack_response(
+        &mut self,
+        protocol_version: ProtocolVersion,
+    ) -> anyhow::Result<Option<ChitchatMessage>> {
+        self.commit_message_plan(
+            InboundMessagePlan {
+                response: Some(ChitchatMessage::Ack {
+                    delta: Delta::default(),
+                }),
+                ..Default::default()
+            },
+            protocol_version,
+        )
+        .map_err(Into::into)
+    }
+
     pub(crate) fn process_message(
         &mut self,
         msg: ChitchatMessage,
@@ -503,76 +615,102 @@ impl Chitchat {
                     );
                     return Ok(Some(ChitchatMessage::BadCluster));
                 }
-                if let Err(error) = self.report_heartbeats_in_digest(&digest) {
-                    if error.is_peer_error() {
-                        debug!(reason=%error, "rejected gossip membership transaction");
-                        // Keep the membership transaction all-or-nothing and
-                        // do not derive a delta from the rejected digest. We
-                        // can still return our valid membership view with an
-                        // empty delta so one poisoned entry does not suppress
-                        // the entire handshake between this pair.
-                        self.validate_local_membership()?;
-                        let scheduled_for_deletion: HashSet<_> =
-                            self.scheduled_for_deletion_nodes().collect();
-                        let self_digest = self.compute_digest(&scheduled_for_deletion);
-                        return Ok(Some(ChitchatMessage::SynAck {
-                            digest: self_digest,
-                            delta: Delta::default(),
-                        }));
+                let membership_update = match self.plan_heartbeats_in_digest(&digest) {
+                    Ok(plan) => plan,
+                    Err(error) if error.is_peer_error() => {
+                        debug!(reason=%error, "rejected inbound SYN transaction");
+                        return self.rejected_syn_response(protocol_version);
                     }
-                    return Err(error.into());
+                    Err(error) => return Err(error.into()),
+                };
+                if let Err(error) =
+                    Self::validate_syn_ack_response_budget(&membership_update, protocol_version)
+                {
+                    debug!(reason=%error, "rejected inbound SYN transaction");
+                    return self.rejected_syn_response(protocol_version);
                 }
-                self.update_self_heartbeat();
+                let plan = InboundMessagePlan {
+                    membership_update: Some(membership_update),
+                    advance_self_heartbeat: true,
+                    ..Default::default()
+                };
+                self.commit_message_plan(plan, protocol_version)?;
                 let scheduled_for_deletion: HashSet<_> =
                     self.scheduled_for_deletion_nodes().collect();
                 let self_digest = self.compute_digest(&scheduled_for_deletion);
                 let digest_len = self_digest.serialized_len(protocol_version);
-                // This is a corrupted local invariant, not a peer error. The
-                // caller deliberately terminates the supervised gossip task
-                // so the owner restarts it instead of staying half-alive.
-                anyhow::ensure!(
-                    digest_len <= MAX_GOSSIP_DIGEST_SIZE,
-                    "local {protocol_version:?} gossip digest is {digest_len} bytes, limit is \
-                     {MAX_GOSSIP_DIGEST_SIZE}"
-                );
                 let delta = self.cluster_state.compute_partial_delta_respecting_mtu(
                     &digest,
                     delta_mtu(digest_len),
                     &scheduled_for_deletion,
                 );
-                Ok(Some(ChitchatMessage::SynAck {
+                let response = ChitchatMessage::SynAck {
                     digest: self_digest,
                     delta,
-                }))
+                };
+                let response_len =
+                    ChitchatEnvelope::serialized_len_for_message(protocol_version, &response);
+                anyhow::ensure!(
+                    response_len <= MAX_UDP_DATAGRAM_PAYLOAD_SIZE,
+                    "committed {protocol_version:?} SYN-ACK response is {response_len} bytes, limit is {MAX_UDP_DATAGRAM_PAYLOAD_SIZE}"
+                );
+                Ok(Some(response))
             }
-            ChitchatMessage::SynAck { digest, delta } => {
-                if let Err(error) = self.report_heartbeats_in_digest(&digest) {
-                    if error.is_peer_error() {
-                        debug!(reason=%error, "rejected gossip membership transaction");
-                        // Do not apply the peer delta after rejecting its
-                        // membership view, but finish the handshake without
-                        // propagating any state derived from that view.
-                        return Ok(Some(ChitchatMessage::Ack {
-                            delta: Delta::default(),
-                        }));
+            ChitchatMessage::SynAck {
+                digest,
+                delta: peer_delta,
+            } => {
+                let membership_update = match self.plan_heartbeats_in_digest(&digest) {
+                    Ok(plan) => plan,
+                    Err(error) if error.is_peer_error() => {
+                        debug!(reason=%error, "rejected inbound SYN-ACK transaction");
+                        return self.rejected_syn_ack_response(protocol_version);
                     }
-                    return Err(error.into());
+                    Err(error) => return Err(error.into()),
+                };
+                if let Err(error) = Self::validate_peer_delta(&peer_delta) {
+                    debug!(reason=%error, "rejected inbound SYN-ACK transaction");
+                    return self.rejected_syn_ack_response(protocol_version);
                 }
-                self.update_self_heartbeat();
-                self.process_delta(delta);
+                let plan = InboundMessagePlan {
+                    membership_update: Some(membership_update),
+                    delta: Some(peer_delta),
+                    advance_self_heartbeat: true,
+                    ..Default::default()
+                };
+                self.commit_message_plan(plan, protocol_version)?;
                 let scheduled_for_deletion =
                     self.scheduled_for_deletion_nodes().collect::<HashSet<_>>();
-                let delta = self.cluster_state.compute_partial_delta_respecting_mtu(
+                let response_delta = self.cluster_state.compute_partial_delta_respecting_mtu(
                     &digest,
                     delta_mtu(0),
                     &scheduled_for_deletion,
                 );
-                Ok(Some(ChitchatMessage::Ack { delta }))
+                let response = ChitchatMessage::Ack {
+                    delta: response_delta,
+                };
+                let response_len =
+                    ChitchatEnvelope::serialized_len_for_message(protocol_version, &response);
+                anyhow::ensure!(
+                    response_len <= MAX_UDP_DATAGRAM_PAYLOAD_SIZE,
+                    "committed {protocol_version:?} ACK response is {response_len} bytes, limit is {MAX_UDP_DATAGRAM_PAYLOAD_SIZE}"
+                );
+                Ok(Some(response))
             }
             ChitchatMessage::Ack { delta } => {
-                self.update_self_heartbeat();
-                self.process_delta(delta);
-                Ok(None)
+                if let Err(error) = Self::validate_peer_delta(&delta) {
+                    debug!(reason=%error, "rejected inbound ACK transaction");
+                    return Ok(None);
+                }
+                self.commit_message_plan(
+                    InboundMessagePlan {
+                        delta: Some(delta),
+                        advance_self_heartbeat: true,
+                        ..Default::default()
+                    },
+                    protocol_version,
+                )
+                .map_err(Into::into)
             }
             ChitchatMessage::BadCluster => {
                 warn!("message rejected by peer: wrong cluster");
@@ -2004,6 +2142,180 @@ mod tests {
     }
 
     #[test]
+    fn test_valid_syn_response_reflects_committed_membership_and_self_heartbeat() {
+        for protocol_version in [ProtocolVersion::V0, ProtocolVersion::V1] {
+            let config = ChitchatConfig::for_test(10_006);
+            let cluster_id = config.cluster_id.clone();
+            let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+            let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+            let self_id = node.self_chitchat_id().clone();
+            let self_heartbeat_before = node.self_node_state().heartbeat();
+            let old_id = ChitchatId::new("response-order-peer", 1, ([127, 0, 0, 1], 20_001).into());
+            let new_id = ChitchatId::new("response-order-peer", 2, ([127, 0, 0, 1], 20_002).into());
+            let mut initial = Digest::default();
+            initial.add_node(old_id.clone(), Heartbeat(1), 0, 0);
+            node.report_heartbeats_in_digest(&initial).unwrap();
+
+            let mut peer_digest = Digest::default();
+            peer_digest.add_node(new_id.clone(), Heartbeat(2), 0, 0);
+            let response = node
+                .process_message(
+                    ChitchatMessage::Syn {
+                        cluster_id,
+                        digest: peer_digest,
+                    },
+                    protocol_version,
+                )
+                .unwrap()
+                .expect("valid SYN response");
+            let ChitchatMessage::SynAck { digest, .. } = &response else {
+                panic!("valid SYN must return SYN-ACK");
+            };
+
+            assert!(digest.node_digests.contains_key(&new_id));
+            assert!(!digest.node_digests.contains_key(&old_id));
+            assert_eq!(
+                digest.node_digests.get(&self_id).unwrap().heartbeat,
+                Heartbeat(self_heartbeat_before.0 + 1)
+            );
+            assert!(node.cluster_state.node_state(&old_id).is_none());
+            assert!(node.cluster_state.node_state(&new_id).is_some());
+            assert_eq!(
+                node.self_node_state().heartbeat(),
+                Heartbeat(self_heartbeat_before.0 + 1)
+            );
+
+            let response_len =
+                ChitchatEnvelope::serialized_len_for_message(protocol_version, &response);
+            assert!(response_len <= MAX_UDP_DATAGRAM_PAYLOAD_SIZE);
+        }
+    }
+
+    #[test]
+    fn test_valid_syn_ack_response_includes_just_committed_peer_delta() {
+        for protocol_version in [ProtocolVersion::V0, ProtocolVersion::V1] {
+            let config = ChitchatConfig::for_test(10_006);
+            let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+            let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+            let self_heartbeat_before = node.self_node_state().heartbeat();
+            let peer_id = ChitchatId::new("delta-order-peer", 1, ([127, 0, 0, 1], 20_003).into());
+            let mut initial = Digest::default();
+            initial.add_node(peer_id.clone(), Heartbeat(1), 0, 0);
+            node.report_heartbeats_in_digest(&initial).unwrap();
+
+            let mut peer_digest = Digest::default();
+            peer_digest.add_node(peer_id.clone(), Heartbeat(2), 0, 0);
+            let mut peer_delta = Delta::default();
+            peer_delta.add_node(peer_id.clone(), 0, 0);
+            peer_delta.add_kv(&peer_id, "committed-before-ack", "value", 1, false);
+            let response = node
+                .process_message(
+                    ChitchatMessage::SynAck {
+                        digest: peer_digest,
+                        delta: peer_delta,
+                    },
+                    protocol_version,
+                )
+                .unwrap()
+                .expect("valid SYN-ACK response");
+            let ChitchatMessage::Ack { delta } = &response else {
+                panic!("valid SYN-ACK must return ACK");
+            };
+            let peer_response = delta.get(&peer_id).expect("just-applied peer delta");
+            assert!(
+                peer_response
+                    .key_values
+                    .iter()
+                    .any(|mutation| mutation.key == "committed-before-ack")
+            );
+            assert_eq!(
+                node.self_node_state().heartbeat(),
+                Heartbeat(self_heartbeat_before.0 + 1)
+            );
+            let response_len =
+                ChitchatEnvelope::serialized_len_for_message(protocol_version, &response);
+            assert!(response_len <= MAX_UDP_DATAGRAM_PAYLOAD_SIZE);
+        }
+    }
+
+    #[test]
+    fn test_wire_delta_with_multibyte_key_is_applied_without_killing_loop() {
+        use crate::delta::DeltaSerializer;
+
+        for protocol_version in [ProtocolVersion::V0, ProtocolVersion::V1] {
+            for is_syn_ack in [false, true] {
+                let config = ChitchatConfig::for_test(10_006);
+                let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+                let mut node =
+                    Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+                let peer_id = ChitchatId::new(
+                    format!("unicode-peer-{is_syn_ack}"),
+                    1,
+                    ([127, 0, 0, 1], if is_syn_ack { 20_004 } else { 20_005 }).into(),
+                );
+                let mut initial = Digest::default();
+                initial.add_node(peer_id.clone(), Heartbeat(1), 0, 0);
+                node.report_heartbeats_in_digest(&initial).unwrap();
+
+                let mut delta_serializer = DeltaSerializer::with_mtu(MAX_UDP_DATAGRAM_PAYLOAD_SIZE);
+                assert!(delta_serializer.try_add_node(peer_id.clone(), 0, 0));
+                assert!(
+                    delta_serializer
+                        .try_add_kv("é-safe", VersionedValue::new("value".to_string(), 1, false))
+                );
+                let delta = delta_serializer.finish();
+                let message = if is_syn_ack {
+                    ChitchatMessage::SynAck {
+                        digest: initial,
+                        delta,
+                    }
+                } else {
+                    ChitchatMessage::Ack { delta }
+                };
+                let envelope = ChitchatEnvelope {
+                    version: protocol_version,
+                    message,
+                };
+                let wire = envelope.serialize_to_vec();
+                let mut wire_cursor = &wire[..];
+                let decoded = ChitchatEnvelope::deserialize(&mut wire_cursor).unwrap();
+                assert!(wire_cursor.is_empty());
+                assert_eq!(decoded.version, protocol_version);
+                let response = node
+                    .process_message(decoded.message, decoded.version)
+                    .unwrap();
+                if is_syn_ack {
+                    assert!(matches!(response, Some(ChitchatMessage::Ack { .. })));
+                } else {
+                    assert!(response.is_none());
+                }
+                assert_eq!(
+                    node.cluster_state
+                        .node_state(&peer_id)
+                        .unwrap()
+                        .get("é-safe"),
+                    Some("value")
+                );
+
+                // The same server instance must continue processing the next
+                // valid packet after the Unicode mutation.
+                let next_envelope = ChitchatEnvelope {
+                    version: protocol_version,
+                    message: ChitchatMessage::Ack {
+                        delta: Delta::default(),
+                    },
+                };
+                let next_wire = next_envelope.serialize_to_vec();
+                let mut next_wire_cursor = &next_wire[..];
+                let next_decoded = ChitchatEnvelope::deserialize(&mut next_wire_cursor).unwrap();
+                assert!(next_wire_cursor.is_empty());
+                node.process_message(next_decoded.message, next_decoded.version)
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn test_oversized_membership_transaction_changes_nothing() {
         let config = ChitchatConfig::for_test(10_006);
         let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
@@ -2133,6 +2445,274 @@ mod tests {
         let known_state = node.cluster_state.node_state(&known_id).unwrap();
         assert_eq!(known_state.heartbeat(), Heartbeat(1));
         assert_eq!(known_state.get("must-not-apply"), None);
+    }
+
+    #[test]
+    fn test_valid_digest_invalid_delta_rejects_whole_packet_and_loop_recovers() {
+        use crate::delta::NodeDelta;
+        use crate::types::{DeletionStatusMutation, KeyValueMutation};
+
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let old_id = ChitchatId::new("atomic-peer", 1, ([127, 0, 0, 1], 20_001).into());
+        let new_id = ChitchatId::new("atomic-peer", 2, ([127, 0, 0, 1], 20_002).into());
+        let other_id = ChitchatId::new("other-peer", 1, ([127, 0, 0, 1], 20_003).into());
+        let stable_id = ChitchatId::new("stable-peer", 1, ([127, 0, 0, 1], 20_004).into());
+        let mut initial_digest = Digest::default();
+        initial_digest.add_node(old_id.clone(), Heartbeat(1), 0, 0);
+        initial_digest.add_node(other_id.clone(), Heartbeat(1), 0, 0);
+        initial_digest.add_node(stable_id.clone(), Heartbeat(1), 0, 0);
+        node.report_heartbeats_in_digest(&initial_digest).unwrap();
+        node.previous_live_nodes.insert(old_id.clone(), 7);
+
+        let callback_count = Arc::new(AtomicUsize::new(0));
+        let callback_count_clone = callback_count.clone();
+        let _listener = node.subscribe_event("", move |_| {
+            callback_count_clone.fetch_add(1, Ordering::Relaxed);
+        });
+        let self_heartbeat_before = node.self_node_state().heartbeat();
+        let high_watermark_before = *node.generation_high_watermarks.peek("atomic-peer").unwrap();
+        let detector_had_old = node.failure_detector.contains_node(&old_id);
+
+        let mut digest = Digest::default();
+        digest.add_node(new_id.clone(), Heartbeat(9), 0, 0);
+        digest.add_node(other_id.clone(), Heartbeat(9), 0, 0);
+        let invalid_delta = Delta::from_node_deltas_for_test(vec![
+            NodeDelta {
+                chitchat_id: stable_id.clone(),
+                from_version_excluded: 0,
+                last_gc_version: 0,
+                key_values: vec![KeyValueMutation {
+                    key: "would-have-fired".to_string(),
+                    value: "value".to_string(),
+                    version: 1,
+                    status: DeletionStatusMutation::Set,
+                }],
+                max_version: 1,
+            },
+            NodeDelta {
+                chitchat_id: other_id.clone(),
+                from_version_excluded: 0,
+                last_gc_version: 0,
+                key_values: vec![KeyValueMutation {
+                    key: "invalid".to_string(),
+                    value: "value".to_string(),
+                    version: 2,
+                    status: DeletionStatusMutation::Set,
+                }],
+                max_version: 1,
+            },
+        ]);
+
+        let response = node
+            .process_message(
+                ChitchatMessage::SynAck {
+                    digest,
+                    delta: invalid_delta,
+                },
+                ProtocolVersion::V0,
+            )
+            .unwrap();
+
+        assert_eq!(
+            response,
+            Some(ChitchatMessage::Ack {
+                delta: Delta::default()
+            })
+        );
+        assert_eq!(node.self_node_state().heartbeat(), self_heartbeat_before);
+        assert!(node.cluster_state.node_state(&old_id).is_some());
+        assert!(node.cluster_state.node_state(&new_id).is_none());
+        assert_eq!(
+            node.cluster_state
+                .node_state(&other_id)
+                .unwrap()
+                .heartbeat(),
+            Heartbeat(1)
+        );
+        assert_eq!(
+            node.cluster_state
+                .node_state(&stable_id)
+                .unwrap()
+                .get("would-have-fired"),
+            None
+        );
+        assert_eq!(callback_count.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            *node.generation_high_watermarks.peek("atomic-peer").unwrap(),
+            high_watermark_before
+        );
+        assert_eq!(
+            node.failure_detector.contains_node(&old_id),
+            detector_had_old
+        );
+        assert!(!node.failure_detector.contains_node(&new_id));
+        assert_eq!(node.previous_live_nodes.get(&old_id), Some(&7));
+
+        // The rejection is private/nonfatal: a later valid ACK mutates state
+        // and triggers the listener normally.
+        let mut valid_delta = Delta::default();
+        valid_delta.add_node(old_id.clone(), 0, 0);
+        valid_delta.add_kv(&old_id, "later-valid", "value", 1, false);
+        assert_eq!(
+            node.process_message(
+                ChitchatMessage::Ack { delta: valid_delta },
+                ProtocolVersion::V0,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            node.cluster_state
+                .node_state(&old_id)
+                .unwrap()
+                .get("later-valid"),
+            Some("value")
+        );
+        assert_eq!(callback_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_oversized_actual_response_is_rejected_before_commit() {
+        use crate::delta::DeltaSerializer;
+
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let peer_id = ChitchatId::new("response-peer", 1, ([127, 0, 0, 1], 20_001).into());
+        let self_heartbeat_before = node.self_node_state().heartbeat();
+        let membership_update = MembershipUpdatePlan {
+            heartbeat_updates: vec![(peer_id.clone(), Heartbeat(1))],
+            ..Default::default()
+        };
+
+        let mut serializer = DeltaSerializer::with_mtu(MAX_UDP_DATAGRAM_PAYLOAD_SIZE * 3);
+        assert!(serializer.try_add_node(peer_id.clone(), 0, 0));
+        for version in 1..=3 {
+            let oversized_value: String = rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(40_000)
+                .map(char::from)
+                .collect();
+            assert!(serializer.try_add_kv(
+                &format!("oversized-{version}"),
+                VersionedValue::new(oversized_value, version, false)
+            ));
+        }
+        let response = ChitchatMessage::Ack {
+            delta: serializer.finish(),
+        };
+        let envelope = ChitchatEnvelope {
+            version: ProtocolVersion::V0,
+            message: response,
+        };
+        assert!(envelope.serialize_to_vec().len() > MAX_UDP_DATAGRAM_PAYLOAD_SIZE);
+
+        let ChitchatEnvelope { message, .. } = envelope;
+        let error = node
+            .commit_message_plan(
+                InboundMessagePlan {
+                    membership_update: Some(membership_update),
+                    response: Some(message),
+                    advance_self_heartbeat: true,
+                    ..Default::default()
+                },
+                ProtocolVersion::V0,
+            )
+            .unwrap_err();
+
+        assert!(error.is_peer_error());
+        assert!(node.cluster_state.node_state(&peer_id).is_none());
+        assert!(!node.failure_detector.contains_node(&peer_id));
+        assert_eq!(node.self_node_state().heartbeat(), self_heartbeat_before);
+    }
+
+    #[test]
+    fn test_invalid_ack_max_version_is_nonfatal_and_non_mutating() {
+        use crate::delta::NodeDelta;
+        use crate::types::{DeletionStatusMutation, KeyValueMutation};
+
+        let config = ChitchatConfig::for_test(10_006);
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let peer_id = ChitchatId::new("ack-peer", 1, ([127, 0, 0, 1], 20_001).into());
+        let mut digest = Digest::default();
+        digest.add_node(peer_id.clone(), Heartbeat(1), 0, 0);
+        node.report_heartbeats_in_digest(&digest).unwrap();
+        let self_heartbeat_before = node.self_node_state().heartbeat();
+        let invalid = Delta::from_node_deltas_for_test(vec![NodeDelta {
+            chitchat_id: peer_id.clone(),
+            from_version_excluded: 0,
+            last_gc_version: 0,
+            key_values: vec![KeyValueMutation {
+                key: "bad".to_string(),
+                value: "value".to_string(),
+                version: 2,
+                status: DeletionStatusMutation::Set,
+            }],
+            max_version: 1,
+        }]);
+
+        assert_eq!(
+            node.process_message(ChitchatMessage::Ack { delta: invalid }, ProtocolVersion::V0,)
+                .unwrap(),
+            None
+        );
+        assert_eq!(node.self_node_state().heartbeat(), self_heartbeat_before);
+        assert_eq!(
+            node.cluster_state.node_state(&peer_id).unwrap().get("bad"),
+            None
+        );
+
+        let mut valid = Delta::default();
+        valid.add_node(peer_id.clone(), 0, 0);
+        valid.add_kv(&peer_id, "good", "value", 1, false);
+        node.process_message(ChitchatMessage::Ack { delta: valid }, ProtocolVersion::V0)
+            .unwrap();
+        assert_eq!(
+            node.cluster_state.node_state(&peer_id).unwrap().get("good"),
+            Some("value")
+        );
+    }
+
+    #[test]
+    fn test_rejected_higher_self_generation_is_non_mutating() {
+        let config = ChitchatConfig::for_test(10_006);
+        let cluster_id = config.cluster_id.clone();
+        let (_seed_addrs_rx, seed_addrs_tx) = watch::channel(Default::default());
+        let mut node = Chitchat::with_chitchat_id_and_seeds(config, seed_addrs_tx, Vec::new());
+        let self_id = node.self_chitchat_id().clone();
+        let self_heartbeat_before = node.self_node_state().heartbeat();
+        let high_watermark_before = *node
+            .generation_high_watermarks
+            .peek(&self_id.node_id)
+            .unwrap();
+        let forged_self = ChitchatId::new(
+            self_id.node_id.clone(),
+            self_id.generation_id + 1,
+            ([127, 0, 0, 1], 30_000).into(),
+        );
+        let mut digest = Digest::default();
+        digest.add_node(forged_self.clone(), Heartbeat(999), 0, 0);
+
+        let response = node
+            .process_message(
+                ChitchatMessage::Syn { cluster_id, digest },
+                ProtocolVersion::V0,
+            )
+            .unwrap();
+
+        assert!(matches!(response, Some(ChitchatMessage::SynAck { .. })));
+        assert_eq!(node.self_node_state().heartbeat(), self_heartbeat_before);
+        assert!(node.cluster_state.node_state(&forged_self).is_none());
+        assert_eq!(
+            *node
+                .generation_high_watermarks
+                .peek(&self_id.node_id)
+                .unwrap(),
+            high_watermark_before
+        );
     }
 
     #[test]

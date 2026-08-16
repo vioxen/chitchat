@@ -61,11 +61,24 @@ async fn wait_until<P: Fn(&BTreeMap<ChitchatId, NodeState>) -> bool>(
     start.elapsed()
 }
 
+async fn wait_for_member_count(handle: &ChitchatHandle, expected: usize) -> Duration {
+    let node_id = handle.chitchat().lock().await.self_chitchat_id().clone();
+    let timeout = Duration::from_secs(60);
+    tokio::time::timeout(timeout, wait_until(handle, |nodes| nodes.len() == expected))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "node {node_id:?} did not converge to {expected} live members within {}s",
+                timeout.as_secs()
+            )
+        })
+}
+
 async fn delay_before_detection_sample(num_nodes: usize, transport: &dyn Transport) -> Duration {
     assert!(num_nodes > 2);
     let mut handles = spawn_nodes(num_nodes as u16, transport).await;
     info!("spawn {num_nodes} nodes");
-    let _delay = wait_until(&handles[1], |nodes| nodes.len() == num_nodes).await;
+    let _delay = wait_for_member_count(&handles[1], num_nodes).await;
     info!("converged on {num_nodes} nodes");
     handles.pop();
     let time_to_death_detection =
@@ -144,7 +157,7 @@ async fn test_bandwidth_aux(num_nodes: usize) -> u64 {
     let handles = spawn_nodes(num_nodes as u16, &transport).await;
     let instant = Instant::now();
     for handle in &handles {
-        wait_until(handle, |nodes| nodes.len() == num_nodes).await;
+        wait_for_member_count(handle, num_nodes).await;
         info!("success");
     }
     let cluster_convergence = instant.elapsed();
@@ -194,7 +207,7 @@ async fn test_faulty_network_stability_aux(num_nodes: usize, transport: &dyn Tra
     let handles = spawn_nodes(num_nodes as u16, transport).await;
     let start = Instant::now();
     for handle in &handles {
-        wait_until(handle, |nodes| nodes.len() == num_nodes).await;
+        wait_for_member_count(handle, num_nodes).await;
     }
     let elapsed = start.elapsed();
     info!("Convergence took {elapsed:?}");
@@ -220,5 +233,5 @@ async fn test_faulty_network_stability_100() {
     // 50% messages are dropped.
     use chitchat::transport::TransportExt;
     let transport: Box<dyn Transport> = ChannelTransport::with_mtu(65_507).drop_message(0.5f64);
-    test_faulty_network_stability_aux(10, &*transport).await;
+    test_faulty_network_stability_aux(100, &*transport).await;
 }
