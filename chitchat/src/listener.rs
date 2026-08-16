@@ -106,8 +106,14 @@ impl InnerListeners {
             return;
         }
 
+        let first_char_end = key_change_event
+            .key
+            .chars()
+            .next()
+            .expect("non-empty key has a first character")
+            .len_utf8();
         let range = (
-            Bound::Included(&key_change_event.key[0..1]),
+            Bound::Included(&key_change_event.key[..first_char_end]),
             Bound::Included(key_change_event.key),
         );
         for (prefix_key, listeners) in self.listeners.range::<str, _>(range) {
@@ -186,6 +192,35 @@ mod tests {
             node: &node_id,
         };
         listeners.trigger_event(key_change_event);
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_listeners_accept_multibyte_utf8_keys() {
+        let mut listeners = Listeners::default();
+        let node_id = chitchat_id(7281u16);
+
+        // Constructing the listener range must be Unicode-safe even when no
+        // callbacks are registered.
+        listeners.trigger_event(KeyChangeEvent {
+            key: "éclair",
+            value: "value",
+            node: &node_id,
+        });
+
+        let counter: Arc<AtomicUsize> = Default::default();
+        let counter_clone = counter.clone();
+        listeners
+            .subscribe_event("é", move |event| {
+                assert_eq!(event.key, "clair");
+                counter_clone.fetch_add(1, Ordering::Relaxed);
+            })
+            .forever();
+        listeners.trigger_event(KeyChangeEvent {
+            key: "éclair",
+            value: "value",
+            node: &node_id,
+        });
         assert_eq!(counter.load(Ordering::Relaxed), 1);
     }
     #[test]

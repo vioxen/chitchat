@@ -404,7 +404,18 @@ impl CompressedStreamWriter {
     }
 }
 
+pub(crate) const MAX_COMPRESSED_STREAM_BLOCK_SIZE: usize = 16_384;
+
+#[cfg(test)]
 pub fn deserialize_stream<D: Deserializable>(buf: &mut &[u8]) -> anyhow::Result<Vec<D>> {
+    deserialize_stream_bounded(buf, usize::MAX, u16::MAX as usize)
+}
+
+pub fn deserialize_stream_bounded<D: Deserializable>(
+    buf: &mut &[u8],
+    max_decompressed_len: usize,
+    max_block_len: usize,
+) -> anyhow::Result<Vec<D>> {
     let mut decompressed_data = Vec::new();
     let mut decompressed_buffer = vec![0; u16::MAX as usize];
     loop {
@@ -420,6 +431,18 @@ pub fn deserialize_stream<D: Deserializable>(buf: &mut &[u8]) -> anyhow::Result<
                     &mut decompressed_buffer[..u16::MAX as usize],
                 )
                 .context("failed to decompress block")?;
+                anyhow::ensure!(
+                    uncompressed_len <= max_block_len,
+                    "compressed stream block expands to {uncompressed_len} bytes, limit is {max_block_len}"
+                );
+                let projected_len = decompressed_data
+                    .len()
+                    .checked_add(uncompressed_len)
+                    .context("compressed stream decompressed length overflow")?;
+                anyhow::ensure!(
+                    projected_len <= max_decompressed_len,
+                    "compressed stream expands to {projected_len} bytes, limit is {max_decompressed_len}"
+                );
                 buf.advance(len);
                 decompressed_data.extend_from_slice(&decompressed_buffer[..uncompressed_len]);
             }
@@ -428,6 +451,18 @@ pub fn deserialize_stream<D: Deserializable>(buf: &mut &[u8]) -> anyhow::Result<
                 let block_bytes = buf.get(..len).context(
                     "failed to download compressed stream (uncompressed block): buffer too short",
                 )?;
+                anyhow::ensure!(
+                    len <= max_block_len,
+                    "uncompressed stream block is {len} bytes, limit is {max_block_len}"
+                );
+                let projected_len = decompressed_data
+                    .len()
+                    .checked_add(len)
+                    .context("compressed stream decompressed length overflow")?;
+                anyhow::ensure!(
+                    projected_len <= max_decompressed_len,
+                    "compressed stream expands to {projected_len} bytes, limit is {max_decompressed_len}"
+                );
                 decompressed_data.extend_from_slice(block_bytes);
                 buf.advance(len);
             }

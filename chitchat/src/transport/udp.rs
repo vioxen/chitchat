@@ -155,6 +155,7 @@ mod tests {
     use tokio::net::UdpSocket as TokioUdpSocket;
 
     use super::*;
+    use crate::delta::Delta;
     use crate::digest::Digest;
 
     async fn sockets() -> (TokioUdpSocket, UdpSocket, SocketAddr) {
@@ -187,5 +188,48 @@ mod tests {
         sender.send_to(&payload, receiver_addr).await.unwrap();
 
         assert!(receiver.receive_one().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_delta_is_dropped_and_next_datagram_is_received() {
+        let (sender, mut receiver, receiver_addr) = sockets().await;
+        let mut malformed = ChitchatEnvelope::new_syn_ack_v0(Digest::default(), Delta::default())
+            .serialize_to_vec();
+        // Replace the empty delta stream with a decoded-peer-only invalid
+        // sequence: KV(version 2), then SetMaxVersion(1).
+        malformed.pop();
+        malformed.extend(Delta::malformed_max_version_stream(
+            crate::ChitchatId::for_local_test(10_001),
+        ));
+        sender.send_to(&malformed, receiver_addr).await.unwrap();
+
+        let valid = ChitchatEnvelope::new_syn_v0("cluster".to_string(), Digest::default());
+        sender
+            .send_to(&valid.serialize_to_vec(), receiver_addr)
+            .await
+            .unwrap();
+
+        let received = receiver.recv().await.unwrap();
+        assert_eq!(received.envelope, valid);
+    }
+
+    #[tokio::test]
+    async fn compressed_delta_bomb_is_dropped_and_next_datagram_is_received() {
+        let (sender, mut receiver, receiver_addr) = sockets().await;
+        let mut bomb = ChitchatEnvelope::new_syn_ack_v0(Digest::default(), Delta::default())
+            .serialize_to_vec();
+        bomb.pop();
+        bomb.extend(Delta::oversized_decompressed_stream_for_test());
+        assert!(bomb.len() <= MAX_UDP_DATAGRAM_PAYLOAD_SIZE);
+        sender.send_to(&bomb, receiver_addr).await.unwrap();
+
+        let valid = ChitchatEnvelope::new_syn_v0("cluster".to_string(), Digest::default());
+        sender
+            .send_to(&valid.serialize_to_vec(), receiver_addr)
+            .await
+            .unwrap();
+
+        let received = receiver.recv().await.unwrap();
+        assert_eq!(received.envelope, valid);
     }
 }

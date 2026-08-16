@@ -6,6 +6,8 @@ use crate::serialize::*;
 use crate::types::{DeletionStatusMutation, KeyValueMutation, KeyValueMutationRef};
 use crate::{ChitchatId, Version, VersionedValue};
 
+pub(crate) const MAX_GOSSIP_DELTA_UNCOMPRESSED_SIZE: usize = 1024 * 1024;
+
 /// A delta is the message we send to another node to update it.
 ///
 /// Its serialization is done by transforming it into a sequence of operations,
@@ -14,6 +16,7 @@ use crate::{ChitchatId, Version, VersionedValue};
 pub struct Delta {
     pub(crate) node_deltas: Vec<NodeDelta>,
     serialized_len: usize,
+    structurally_validated: bool,
 }
 
 impl Default for Delta {
@@ -21,11 +24,51 @@ impl Default for Delta {
         Delta {
             node_deltas: Vec::new(),
             serialized_len: 1,
+            structurally_validated: true,
         }
     }
 }
 
 impl Delta {
+    /// Validates the invariants relied upon by state application.
+    ///
+    /// Deserialization performs the same checks while building a delta, but
+    /// keeping this validation at the admission boundary makes the safety
+    /// proof explicit and also protects callers that construct a `Delta`
+    /// internally (including tests).
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
+        if self.structurally_validated {
+            return Ok(());
+        }
+        let mut node_ids = HashSet::with_capacity(self.node_deltas.len());
+        for node_delta in &self.node_deltas {
+            anyhow::ensure!(
+                node_ids.insert(&node_delta.chitchat_id),
+                "delta contains duplicate node {:?}",
+                node_delta.chitchat_id
+            );
+            let mut previous_version = 0;
+            for mutation in &node_delta.key_values {
+                anyhow::ensure!(
+                    mutation.version > previous_version,
+                    "delta key versions must be strictly increasing"
+                );
+                previous_version = mutation.version;
+            }
+            if !node_delta.key_values.is_empty() {
+                anyhow::ensure!(
+                    node_delta.max_version == previous_version,
+                    "delta max version must equal its highest key version"
+                );
+                anyhow::ensure!(
+                    node_delta.from_version_excluded <= node_delta.max_version,
+                    "delta starts after its max version"
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn get_operations(&self) -> impl Iterator<Item = DeltaOpRef<'_>> {
         self.node_deltas.iter().flat_map(|node_delta| {
             std::iter::once(DeltaOpRef::Node {
@@ -220,7 +263,15 @@ impl Serializable for DeltaOpRef<'_> {
 impl Serializable for Delta {
     fn serialize(&self, buf: &mut Vec<u8>) {
         let mut compressed_stream_writer = CompressedStreamWriter::with_block_threshold(16_384);
+        let mut uncompressed_len = 0usize;
         for op in self.get_operations() {
+            uncompressed_len = uncompressed_len
+                .checked_add(op.serialized_len())
+                .expect("local delta uncompressed length overflow");
+            assert!(
+                uncompressed_len <= MAX_GOSSIP_DELTA_UNCOMPRESSED_SIZE,
+                "local delta expands to {uncompressed_len} bytes, limit is {MAX_GOSSIP_DELTA_UNCOMPRESSED_SIZE}"
+            );
             compressed_stream_writer.append(&op);
         }
         let payload = compressed_stream_writer.finish();
@@ -236,18 +287,74 @@ impl Serializable for Delta {
 impl Deserializable for Delta {
     fn deserialize(buf: &mut &[u8]) -> anyhow::Result<Self> {
         let original_len = buf.len();
-        let ops: Vec<DeltaOp> = crate::serialize::deserialize_stream(buf)?;
+        let ops: Vec<DeltaOp> = crate::serialize::deserialize_stream_bounded(
+            buf,
+            MAX_GOSSIP_DELTA_UNCOMPRESSED_SIZE,
+            crate::serialize::MAX_COMPRESSED_STREAM_BLOCK_SIZE,
+        )?;
         let consumed_len = original_len - buf.len();
         let mut delta_builder = DeltaBuilder::default();
         for op in ops {
             delta_builder.apply_op(op)?;
         }
-        Ok(delta_builder.finish(consumed_len))
+        delta_builder.finish(consumed_len)
     }
 }
 
 #[cfg(test)]
 impl Delta {
+    /// Produces a peer wire stream that no local serializer can emit: a key
+    /// mutation followed by a lower max-version instruction.
+    pub(crate) fn malformed_max_version_stream(chitchat_id: ChitchatId) -> Vec<u8> {
+        let mut writer = CompressedStreamWriter::with_block_threshold(16_384);
+        writer.append(&DeltaOp::Node {
+            chitchat_id,
+            last_gc_version: 0,
+            from_version_excluded: 0,
+        });
+        writer.append(&DeltaOp::KeyValue(KeyValueMutation {
+            key: "wire-key".to_string(),
+            value: "wire-value".to_string(),
+            version: 2,
+            status: DeletionStatusMutation::Set,
+        }));
+        writer.append(&DeltaOp::SetMaxVersion { max_version: 1 });
+        writer.finish()
+    }
+
+    pub(crate) fn oversized_decompressed_stream_for_test() -> Vec<u8> {
+        Self::compressed_blocks_for_test(
+            crate::serialize::MAX_COMPRESSED_STREAM_BLOCK_SIZE,
+            MAX_GOSSIP_DELTA_UNCOMPRESSED_SIZE / crate::serialize::MAX_COMPRESSED_STREAM_BLOCK_SIZE
+                + 1,
+        )
+    }
+
+    fn compressed_blocks_for_test(block_len: usize, block_count: usize) -> Vec<u8> {
+        let compressed = zstd::bulk::compress(&vec![0_u8; block_len], 0).unwrap();
+        let compressed_len = u16::try_from(compressed.len()).unwrap();
+        let mut stream = Vec::new();
+        for _ in 0..block_count {
+            // BlockType::Compressed followed by its u16 wire length.
+            1_u8.serialize(&mut stream);
+            compressed_len.serialize(&mut stream);
+            stream.extend_from_slice(&compressed);
+        }
+        // BlockType::NoMoreBlocks.
+        0_u8.serialize(&mut stream);
+        stream
+    }
+
+    pub(crate) fn from_node_deltas_for_test(node_deltas: Vec<NodeDelta>) -> Self {
+        Self {
+            node_deltas,
+            // Admission tests do not serialize this intentionally malformed
+            // in-memory value.
+            serialized_len: 1,
+            structurally_validated: false,
+        }
+    }
+
     pub(crate) fn num_tuples(&self) -> usize {
         self.node_deltas
             .iter()
@@ -360,13 +467,14 @@ struct DeltaBuilder {
     existing_nodes: HashSet<ChitchatId>,
     delta: Delta,
     current_node_delta: Option<NodeDelta>,
+    saw_max_version: bool,
 }
 
 impl DeltaBuilder {
-    fn finish(mut self, len: usize) -> Delta {
-        self.flush();
+    fn finish(mut self, len: usize) -> anyhow::Result<Delta> {
+        self.flush()?;
         self.delta.serialized_len = len;
-        self.delta
+        Ok(self.delta)
     }
 
     fn apply_op(&mut self, op: DeltaOp) -> anyhow::Result<()> {
@@ -376,9 +484,10 @@ impl DeltaBuilder {
                 last_gc_version,
                 from_version_excluded,
             } => {
-                self.flush();
+                self.flush()?;
                 anyhow::ensure!(!self.existing_nodes.contains(&chitchat_id));
                 self.existing_nodes.insert(chitchat_id.clone());
+                self.saw_max_version = false;
                 self.current_node_delta = Some(NodeDelta {
                     chitchat_id,
                     last_gc_version,
@@ -388,35 +497,55 @@ impl DeltaBuilder {
                 });
             }
             DeltaOp::KeyValue(key_value_mutation) => {
+                anyhow::ensure!(
+                    !self.saw_max_version,
+                    "received a key-value op after a max-version op"
+                );
                 let current_node_delta = self
                     .current_node_delta
                     .as_mut()
                     .context("received a key-value op without a node op before.")?;
                 anyhow::ensure!(
                     current_node_delta.max_version < key_value_mutation.version,
-                    "kv version should be striclty increasing"
+                    "kv version should be strictly increasing"
                 );
                 current_node_delta.max_version = key_value_mutation.version;
                 current_node_delta.key_values.push(key_value_mutation);
             }
             DeltaOp::SetMaxVersion { max_version } => {
+                anyhow::ensure!(
+                    !self.saw_max_version,
+                    "received more than one max-version op for a node"
+                );
                 let Some(current_node_delta) = self.current_node_delta.as_mut() else {
-                    anyhow::bail!("received a key-value op without a node op before.");
+                    anyhow::bail!("received a max-version op without a node op before.");
                 };
+                self.saw_max_version = true;
                 current_node_delta.max_version = max_version;
             }
         }
         Ok(())
     }
 
-    fn flush(&mut self) {
+    fn flush(&mut self) -> anyhow::Result<()> {
         let Some(node_delta) = self.current_node_delta.take() else {
             // There are no nodes in the builder.
             // (this happens when the delta builder is freshly created and no ops have been received
             // yet.)
-            return;
+            return Ok(());
         };
+        if let Some(last_mutation) = node_delta.key_values.last() {
+            anyhow::ensure!(
+                node_delta.max_version == last_mutation.version,
+                "delta max version must equal its highest key version"
+            );
+            anyhow::ensure!(
+                node_delta.from_version_excluded <= node_delta.max_version,
+                "delta starts after its max version"
+            );
+        }
         self.delta.node_deltas.push(node_delta);
+        Ok(())
     }
 }
 
@@ -429,6 +558,7 @@ pub struct DeltaSerializer {
     mtu: usize,
     delta_builder: DeltaBuilder,
     compressed_stream_writer: CompressedStreamWriter,
+    uncompressed_len: usize,
 }
 
 const BLOCK_THRESHOLD: u16 = 16_384u16;
@@ -441,6 +571,7 @@ impl DeltaSerializer {
             mtu,
             delta_builder: DeltaBuilder::default(),
             compressed_stream_writer: CompressedStreamWriter::with_block_threshold(block_threshold),
+            uncompressed_len: 0,
         }
     }
 
@@ -451,6 +582,14 @@ impl DeltaSerializer {
     }
 
     fn try_add_op(&mut self, delta_op: DeltaOp) -> bool {
+        let Some(projected_uncompressed_len) =
+            self.uncompressed_len.checked_add(delta_op.serialized_len())
+        else {
+            return false;
+        };
+        if projected_uncompressed_len > MAX_GOSSIP_DELTA_UNCOMPRESSED_SIZE {
+            return false;
+        }
         if self
             .compressed_stream_writer
             .serialized_len_upperbound_after(&delta_op)
@@ -459,6 +598,7 @@ impl DeltaSerializer {
             return false;
         }
         self.compressed_stream_writer.append(&delta_op);
+        self.uncompressed_len = projected_uncompressed_len;
         assert!(self.delta_builder.apply_op(delta_op).is_ok());
         true
     }
@@ -492,7 +632,9 @@ impl DeltaSerializer {
 
     pub fn finish(self) -> Delta {
         let buffer = self.compressed_stream_writer.finish();
-        self.delta_builder.finish(buffer.len())
+        self.delta_builder
+            .finish(buffer.len())
+            .expect("locally serialized deltas must be structurally valid")
     }
 }
 
@@ -502,6 +644,105 @@ mod tests {
 
     use super::*;
     use crate::types::DeletionStatus;
+
+    fn deserialize_ops(ops: impl IntoIterator<Item = DeltaOp>) -> anyhow::Result<Delta> {
+        let mut writer = CompressedStreamWriter::with_block_threshold(16_384);
+        for op in ops {
+            writer.append(&op);
+        }
+        let bytes = writer.finish();
+        Delta::deserialize(&mut &bytes[..])
+    }
+
+    fn node_op() -> DeltaOp {
+        DeltaOp::Node {
+            chitchat_id: ChitchatId::for_local_test(10_001),
+            last_gc_version: 0,
+            from_version_excluded: 0,
+        }
+    }
+
+    fn key_op(version: Version) -> DeltaOp {
+        DeltaOp::KeyValue(KeyValueMutation {
+            key: "key".to_string(),
+            value: "value".to_string(),
+            version,
+            status: DeletionStatusMutation::Set,
+        })
+    }
+
+    #[test]
+    fn test_deserialize_rejects_oversized_compressed_block() {
+        let stream = Delta::compressed_blocks_for_test(
+            crate::serialize::MAX_COMPRESSED_STREAM_BLOCK_SIZE + 1,
+            1,
+        );
+        let error = Delta::deserialize(&mut &stream[..]).unwrap_err();
+        assert!(error.to_string().contains("block expands"));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_aggregate_decompression_bomb() {
+        let stream = Delta::oversized_decompressed_stream_for_test();
+        assert!(stream.len() < 4_096, "test fixture must stay wire-small");
+        let error = Delta::deserialize(&mut &stream[..]).unwrap_err();
+        assert!(error.to_string().contains("compressed stream expands"));
+        assert!(error.to_string().contains("1048576"));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_noncanonical_max_version_values() {
+        for max_version in [1, 3] {
+            let error =
+                deserialize_ops([node_op(), key_op(2), DeltaOp::SetMaxVersion { max_version }])
+                    .unwrap_err();
+            assert!(error.to_string().contains("highest key version"));
+        }
+        deserialize_ops([
+            node_op(),
+            key_op(2),
+            DeltaOp::SetMaxVersion { max_version: 2 },
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn test_deserialize_rejects_mutation_after_or_repeated_max_version() {
+        assert!(
+            deserialize_ops([
+                node_op(),
+                DeltaOp::SetMaxVersion { max_version: 2 },
+                key_op(3),
+            ])
+            .unwrap_err()
+            .to_string()
+            .contains("after a max-version")
+        );
+        assert!(
+            deserialize_ops([
+                node_op(),
+                DeltaOp::SetMaxVersion { max_version: 2 },
+                DeltaOp::SetMaxVersion { max_version: 3 },
+            ])
+            .unwrap_err()
+            .to_string()
+            .contains("more than one")
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_nonempty_delta_starting_after_max() {
+        let mut writer = CompressedStreamWriter::with_block_threshold(16_384);
+        writer.append(&DeltaOp::Node {
+            chitchat_id: ChitchatId::for_local_test(10_001),
+            last_gc_version: 0,
+            from_version_excluded: 3,
+        });
+        writer.append(&key_op(2));
+        let bytes = writer.finish();
+        let error = Delta::deserialize(&mut &bytes[..]).unwrap_err();
+        assert!(error.to_string().contains("starts after"));
+    }
 
     #[test]
     fn test_delta_serialization_default() {

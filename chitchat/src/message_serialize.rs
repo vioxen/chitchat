@@ -92,13 +92,20 @@ impl ChitchatEnvelope {
     }
 
     pub(crate) fn serialized_len(&self) -> usize {
+        Self::serialized_len_for_message(self.version, &self.message)
+    }
+
+    pub(crate) fn serialized_len_for_message(
+        version: ProtocolVersion,
+        message: &ChitchatMessage,
+    ) -> usize {
         Self::HEADER_LEN
-            + match &self.message {
+            + match message {
                 ChitchatMessage::Syn { cluster_id, digest } => {
-                    cluster_id.serialized_len() + digest.serialized_len(self.version)
+                    cluster_id.serialized_len() + digest.serialized_len(version)
                 }
                 ChitchatMessage::SynAck { digest, delta } => {
-                    digest.serialized_len(self.version) + delta.serialized_len()
+                    digest.serialized_len(version) + delta.serialized_len()
                 }
                 ChitchatMessage::Ack { delta } => delta.serialized_len(),
                 ChitchatMessage::BadCluster => 0,
